@@ -25,17 +25,43 @@ fi
 
 export PYTHONPATH="$ROOT_DIR"
 
-UVICORN_CMD=("$PYTHON" -m uvicorn api.main:app --host 127.0.0.1 --port 8000 --log-level info)
+find_free_port() {
+  local start=$1
+  local end=$2
+  for ((p=start; p<=end; p++)); do
+    if ! lsof -i :$p -sTCP:LISTEN >/dev/null 2>&1; then
+      echo $p
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Choose ports (try defaults then fallback range)
+UVICORN_PORT=$(find_free_port 8000 8010 || true)
+if [ -z "$UVICORN_PORT" ]; then
+  echo "No free port found for uvicorn in range 8000-8010" >&2
+  exit 1
+fi
+
+GRADIO_PORT=$(find_free_port 7860 7870 || true)
+if [ -z "$GRADIO_PORT" ]; then
+  echo "No free port found for Gradio in range 7860-7870" >&2
+  exit 1
+fi
+
+UVICORN_CMD=("$PYTHON" -m uvicorn api.main:app --host 127.0.0.1 --port $UVICORN_PORT --log-level info)
+export GRADIO_SERVER_PORT=$GRADIO_PORT
 GRADIO_CMD=("$PYTHON" "$ROOT_DIR/app/main.py")
 
-echo "Starting backend: ${UVICORN_CMD[*]}"
+echo "Starting backend on port $UVICORN_PORT: ${UVICORN_CMD[*]}"
 "${UVICORN_CMD[@]}" &
 UVICORN_PID=$!
 echo "uvicorn PID=$UVICORN_PID"
 
 sleep 0.4
 
-echo "Starting Gradio UI: ${GRADIO_CMD[*]}"
+echo "Starting Gradio UI on port $GRADIO_PORT: ${GRADIO_CMD[*]}"
 "${GRADIO_CMD[@]}" &
 GRADIO_PID=$!
 echo "gradio PID=$GRADIO_PID"
