@@ -20,7 +20,7 @@ jobs:
         run: flake8 .
       - name: Run tests with coverage
         run: |
-          pytest -q --cov=agentic-rag-mvp --cov-report=xml:coverage.xml --cov-report=html:coverage_html
+          pytest -q --cov=agentic-rag-mvp --cov-report=xml:coverage.xml --cov-report=html:coverage_html --cov-fail-under=80
       - name: Upload coverage artifact
         uses: actions/upload-artifact@v4
         with:
