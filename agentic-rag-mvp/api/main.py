@@ -6,6 +6,11 @@ from typing import List, Dict, Any
 from api.tools.recommender import rank_candidates
 from api.tools import rag
 from api.models_llm import JustifyResponse  # <-- NEW
+from api.routes import llm as llm_routes
+
+app = FastAPI(title="Agentic RAG MVP API")
+app.include_router(llm_routes.router)
+
 
 app = FastAPI(title="Reading Assistant API (MVP)")
 

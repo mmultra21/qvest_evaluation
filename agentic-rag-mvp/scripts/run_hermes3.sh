@@ -1,65 +1,66 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-#!/usr/bin/env bash
-set -euo pipefail
-
-# Auto-detect llama.cpp server binary and provide a readiness probe.
-
-# Base llama.cpp directory (can override):
 LLAMA_DIR="${LLAMA_DIR:-$HOME/src/llama.cpp}"
+# Support both old and new binary names
+POSSIBLE_BINARIES=(
+  "$LLAMA_DIR/build/bin/llama-server"
+  "$LLAMA_DIR/build/bin/server"
+  "$LLAMA_DIR/server"
+  "$LLAMA_DIR/build/server"
+)
 
-# Common binary locations relative to LLAMA_DIR
-POSSIBLE_BINARIES=("$LLAMA_DIR/server" "$LLAMA_DIR/build/server" "$LLAMA_DIR/build/bin/llama-server" "$LLAMA_DIR/build/bin/server")
-
-# Resolve server binary
 SERVER_BIN=""
 for p in "${POSSIBLE_BINARIES[@]}"; do
-  if [ -x "$p" ]; then
-    SERVER_BIN="$p"
-    break
-  fi
+  if [[ -x "$p" ]]; then SERVER_BIN="$p"; break; fi
 done
-
-if [ -z "$SERVER_BIN" ]; then
-  echo "Could not find llama.cpp server binary in one of: ${POSSIBLE_BINARIES[*]}"
-  echo "Build llama.cpp first or set LLAMA_DIR to the folder containing the server binary."
+if [[ -z "$SERVER_BIN" ]]; then
+  echo "❌ Could not find llama-server binary under $LLAMA_DIR" >&2
   exit 1
 fi
 
-# Path to your Hermes3 quantized GGUF (override with HERMES3_GGUF)
 MODEL_PATH="${HERMES3_GGUF:-$HOME/models/llama/hermes3-8b.Q4_K_M.gguf}"
-
-# Port and host (default to localhost for safety)
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-11434}"
+LOG="${LOG:-/tmp/llm_server.log}"
+PID_FILE="${PID_FILE:-/tmp/llm_server.pid}"
 
 echo "Starting Hermes-3 server: $SERVER_BIN"
-echo "Model: $MODEL_PATH" "Host: $HOST Port: $PORT"
+echo "Model: $MODEL_PATH  Host: $HOST  Port: $PORT"
+echo "(logs: $LOG)"
 
-# Start server in background
+# Start in background & log to file
 "$SERVER_BIN" \
   -m "$MODEL_PATH" \
-  --host "$HOST" \
-  --port "$PORT" \
-  -c 4096 --keep -1 --mlock &
+  --host "$HOST" --port "$PORT" \
+  -c 4096 --keep -1 --mlock \
+  >"$LOG" 2>&1 &
 
 SERVER_PID=$!
+echo "$SERVER_PID" > "$PID_FILE"
 
-echo "Waiting for server to become ready (timeout 60s)..."
-RETRY=0
-MAX_RETRIES=60
-until curl -sS "http://$HOST:$PORT/health" >/dev/null 2>&1 || [ $RETRY -ge $MAX_RETRIES ]; do
-  RETRY=$((RETRY + 1))
+# Readiness: wait for HTTP 200 on /health
+echo -n "Waiting for server to become ready (timeout 180s)"
+READY=0
+for i in {1..180}; do
+  # capture only HTTP code
+  CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://$HOST:$PORT/health" || true)
+  if [[ "$CODE" == "200" ]]; then
+    READY=1
+    break
+  fi
+  echo -n "."
   sleep 1
 done
+echo
 
-if [ $RETRY -ge $MAX_RETRIES ]; then
-  echo "Server did not become ready in time. Check logs or run the server manually. (PID=$SERVER_PID)"
+if [[ "$READY" -ne 1 ]]; then
+  echo "❌ Server did not become ready in time. Last 50 log lines:"
+  tail -n 50 "$LOG" || true
+  kill "$SERVER_PID" 2>/dev/null || true
   exit 1
 fi
 
-echo "Server ready (PID=$SERVER_PID)"
-echo "To stop: kill $SERVER_PID"
-
-wait $SERVER_PID
+echo "✅ Server ready (PID=$(cat "$PID_FILE")). To stop: kill $(cat "$PID_FILE")"
+# Keep the process in the foreground of the script so Ctrl+C stops both
+wait "$SERVER_PID"
