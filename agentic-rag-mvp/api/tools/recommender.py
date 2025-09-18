@@ -10,7 +10,18 @@ CATALOG: List[Dict[str, Any]] = [
     {"id":"bk7","title":"Court Comics","subjects":["graphic novels","friendship"],"summary":"Panels follow a middle-school squad through ups and downs.","lexile":690,"grades":[3,4,5],"shelf_location":"G4-GRA-04"},
 ]
 
-GRADE_LEX = {3:(500,820), 4:(650,940), 5:(730,1030), 6:(770,1090)}
+"""Common utilities and constants.
+
+# Common Core "stretch" Lexile bands (3rd–6th grade only shown here)
+"""
+
+GRADE_LEX = {
+    3: (520, 820),
+    4: (740, 940),
+    5: (830, 1010),
+    6: (925, 1070),
+    # add more if you extend to grades 7–12
+}
 
 def _level_fit(lexile: Optional[int], grade: int) -> float:
     if not lexile:
