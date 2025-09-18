@@ -1,5 +1,6 @@
 from typing import List, Dict, Any
 from . import llm_client
+import os
 
 # Grade -> Lexile bands used for the fallback clause if the LLM omits it
 # Common Core "stretch" Lexile bands (3rd–6th grade only shown here)
@@ -74,6 +75,15 @@ def justify(req: Dict[str, Any]) -> List[Dict[str, Any]]:
     returns a list: [{catalog_id, pitch, why, shelf}] (max 5).
     Enforces a Lexile clause in 'why' if the model omits it.
     """
+    # Development hook: allow forcing a malformed LLM response so the API's
+    # validation path (422) and the UI error surface can be exercised. This
+    # is guarded by the RAG_FORCE_MALFORMED env var and should be off in prod.
+    # Require an explicit allow flag plus the force flag so this dev hook
+    # cannot accidentally be left enabled in CI or production environments.
+    if os.environ.get("RAG_FORCE_MALFORMED") == "1" and os.environ.get("ALLOW_DEV_HOOKS") == "1":
+        # Immediately return a malformed item (skip the usual repair/augmentation)
+        # so the API-level Pydantic validation can fail and produce a 422.
+        return [{"catalog_id": "dev-bad", "pitch": "Dev pitch.", "why": "no reading level info provided", "shelf": ""}]
     user = _render_user(req)
     resp = llm_client.call_llm_json(SYSTEM, user)
     raw_items = resp.get("items", []) if isinstance(resp, dict) else []
