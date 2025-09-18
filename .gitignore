@@ -1,0 +1,8 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+
+# Coverage
+coverage.xml
+coverage_html/
