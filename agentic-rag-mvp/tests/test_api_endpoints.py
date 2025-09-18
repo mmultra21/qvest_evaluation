@@ -42,3 +42,25 @@ def test_recommend_and_justify_flow():
         assert "catalog_id" in itm
         assert "pitch" in itm
         assert "why" in itm
+
+
+def test_justify_returns_422_on_malformed_llm(monkeypatch):
+    """Simulate LLM drift: rag.justify returns items missing a Lexile clause and /justify should return 422."""
+
+    # Prepare a malformed item (why lacks 'Lexile')
+    bad_items = [
+        {"catalog_id": "bk1", "pitch": "A short pitch.", "why": "too short note", "shelf": "featured"}
+    ]
+
+    def fake_justify(_req):
+        return bad_items
+
+    # Patch the rag.justify function used by the API
+    import api.tools.rag as rag_mod
+
+    monkeypatch.setattr(rag_mod, "justify", fake_justify)
+
+    # Now call the endpoint with a valid candidate payload
+    payload = {"candidates": [{"catalog_id": "bk1", "payload": {}, "scores": {}, "reason_tags": []}], "student": {"grade": 4, "interests": ["sports"], "progress_bucket": "starter"}, "notes": None}
+    r = client.post("/justify", json=payload)
+    assert r.status_code == 422

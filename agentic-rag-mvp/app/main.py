@@ -11,26 +11,58 @@ def load_banner():
         return "**Reading Week**  \nRead 1 book to enter the prize drawing!"
 
 def get_top5(grade, interests, bucket):
-    rec = requests.post(f"{API}/recommend", json={
-        "grade": int(grade), "interests": interests or [], "progress_bucket": bucket, "top_k": 10
-    }, timeout=20).json()
-    cands = rec.get("candidates", [])
-    jus = requests.post(f"{API}/justify", json={
-        "candidates": cands,
-        "student": {"grade": int(grade), "interests": interests or [], "progress_bucket": bucket},
-        "notes": None
-    }, timeout=120).json()
+    """
+    Returns: (cards_json, error_markdown_update)
+    If an error occurs or Pydantic 422 is returned, we surface a red box with details.
+    """
+    try:
+        # 1) Recommend
+        rec_resp = requests.post(
+            f"{API}/recommend",
+            json={"grade": int(grade), "interests": interests or [], "progress_bucket": bucket, "top_k": 10},
+            timeout=20,
+        )
+        rec_resp.raise_for_status()
+        cands = rec_resp.json().get("candidates", [])
 
-    title_by_id = {c["catalog_id"]: c["payload"]["title"] for c in cands}
-    cards = []
-    for it in jus.get("items", []):
-        cards.append({
-            "title": title_by_id.get(it["catalog_id"], it["catalog_id"]),
-            "pitch": it.get("pitch",""),
-            "why": it.get("why",""),
-            "shelf": it.get("shelf",""),
-        })
-    return cards
+        # 2) Justify (Hermes-3)
+        jus_resp = requests.post(
+            f"{API}/justify",
+            json={
+                "candidates": cands,
+                "student": {"grade": int(grade), "interests": interests or [], "progress_bucket": bucket},
+                "notes": None,
+            },
+            timeout=120,
+        )
+
+        # If Hermes-3 drifted, API returns a 422 with detail—show it
+        if jus_resp.status_code != 200:
+            try:
+                detail = jus_resp.json().get("detail", "Validation failed.")
+            except Exception:
+                detail = f"Validation failed with status {jus_resp.status_code}."
+            msg = f"❌ Recommendation explanation failed:\n\n```\n{detail}\n```"
+            return [], gr.update(value=msg, visible=True)
+
+        data = jus_resp.json()
+        items = data.get("items", [])
+        title_by_id = {c["catalog_id"]: c["payload"]["title"] for c in cands}
+        cards = [
+            {
+                "title": title_by_id.get(it["catalog_id"], it["catalog_id"]),
+                "pitch": it.get("pitch", ""),
+                "why": it.get("why", ""),
+                "shelf": it.get("shelf", ""),
+            }
+            for it in items
+        ]
+        # Success → hide error box
+        return cards, gr.update(value="", visible=False)
+
+    except Exception as e:
+        msg = f"❌ Error talking to API:\n\n```\n{e}\n```"
+        return [], gr.update(value=msg, visible=True)
 
 def refresh_report():
     # Placeholder until metrics tables are wired; keeps UI flowing
@@ -54,11 +86,12 @@ with gr.Blocks(title="Reading Assistant", theme=gr.themes.Soft()) as demo:
                 label="Pick a couple interests"
             )
             bucket = gr.Dropdown(["starter","building","streak"], value="starter", label="Reading progress")
-        btn = gr.Button("Get my Top 5")
-        out = gr.JSON(label="Your picks")
+    btn = gr.Button("Get my Top 5")
+    out = gr.JSON(label="Your picks")
+    error_box = gr.Markdown(visible=False)  # <-- NEW: error surface
 
-        demo.load(load_banner, outputs=[banner])
-        btn.click(get_top5, [grade, interests, bucket], out)
+    demo.load(load_banner, outputs=[banner])
+    btn.click(get_top5, [grade, interests, bucket], [out, error_box])
 
     with gr.Tab("Librarian Console"):
         gr.Markdown("### Weekly KPIs")

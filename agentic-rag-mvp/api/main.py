@@ -1,8 +1,11 @@
 from typing import List, Optional, Dict, Any
-from fastapi import FastAPI
-from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
+from typing import List, Dict, Any
 
 from api.tools.recommender import rank_candidates
+from api.tools import rag
+from api.models_llm import JustifyResponse  # <-- NEW
 
 app = FastAPI(title="Reading Assistant API (MVP)")
 
@@ -17,21 +20,28 @@ CAMPAIGN = {
 
 class RecommendRequest(BaseModel):
     grade: int
-    interests: Optional[List[str]] = []
-    progress_bucket: Optional[str] = "normal"
-    top_k: Optional[int] = 5
+    interests: List[str] = Field(default_factory=list)
+    progress_bucket: str = "normal"
+    top_k: int = 5
 
 
-class JustifyStudent(BaseModel):
+class Candidate(BaseModel):
+    catalog_id: str
+    payload: Dict[str, Any] = Field(default_factory=dict)
+    scores: Dict[str, float] = Field(default_factory=dict)
+    reason_tags: List[str] = Field(default_factory=list)
+
+
+class Student(BaseModel):
     grade: int
-    interests: Optional[List[str]] = []
-    progress_bucket: Optional[str] = "normal"
+    interests: List[str] = Field(default_factory=list)
+    progress_bucket: str = "starter"
 
 
 class JustifyRequest(BaseModel):
-    candidates: List[Dict[str, Any]]
-    student: JustifyStudent
-    notes: Optional[str] = None
+    candidates: List[Candidate]
+    student: Student
+    notes: str | None = None
 
 
 @app.get("/campaign/current")
@@ -55,36 +65,12 @@ def recommend(req: RecommendRequest):
     return {"candidates": ranked}
 
 
-@app.post("/justify")
+@app.post("/justify", response_model=JustifyResponse)  # <-- response_model enforces schema on output
 def justify(req: JustifyRequest):
-    """Return simple justifications and pitches for each candidate.
-
-    This is a lightweight placeholder justifier used by the Gradio UI.
-    """
-    items = []
-    student_interests = set((req.student.interests or []))
-
-    for c in req.candidates:
-        cid = c.get("catalog_id")
-        payload = c.get("payload", {})
-        title = payload.get("title", cid)
-        subjects = payload.get("subjects", [])
-        summary = payload.get("summary", "")
-        shelf = payload.get("shelf_location") or payload.get("shelf_location", "")
-
-        # Build a short pitch and a 'why' that references student interests if present
-        pitch = f"{title}: {summary[:120]}"
-        matched = list(set(subjects) & student_interests)
-        if matched:
-            why = f"Good match: aligns with interests in {', '.join(matched)}."
-        else:
-            why = "A fun pick to broaden interests and practice grade-level reading."
-
-        items.append({
-            "catalog_id": cid,
-            "pitch": pitch,
-            "why": why,
-            "shelf": shelf,
-        })
-
-    return {"items": items}
+    items = rag.justify(req.model_dump())
+    try:
+        # Validate LLM output against schema (guarantees JSON shape & Lexile clause, etc.)
+        return JustifyResponse(items=items)
+    except Exception as e:
+        # Turn validation issues into a clear 422 for the UI layer
+        raise HTTPException(status_code=422, detail=str(e))
