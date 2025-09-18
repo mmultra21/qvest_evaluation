@@ -16,6 +16,7 @@ from api.tools.recommender import rank_candidates
 from api.tools import rag
 from api.models_llm import JustifyResponse
 from api.routes import llm as llm_routes
+from app.vector_store import upsert_chunks
 
 # Optional: local Hermes-3 client (native llama.cpp endpoints)
 try:
@@ -313,16 +314,39 @@ def ui_librarian_book_prompt(book_id: str, question: str, allow_web: bool):
         return f"[LLM error] {e}"
 
 def ui_rag_upload(files: list[gr.File]) -> str:
+    def chunk_text(name: str, text: str, max_len: int = 800, overlap: int = 100):
+        chunks = []
+        i = 0
+        idx = 0
+        while i < len(text):
+            chunk = text[i:i+max_len]
+            chunks.append({
+                "id": f"{name}-{idx}",
+                "text": chunk,
+                "meta": {"source": name}
+            })
+            i += max_len - overlap
+            idx += 1
+        return chunks
+
     if not files:
         return json.dumps({"message": "No files provided."}, indent=2)
+
     added = []
     for f in files:
         try:
-            text = f.read().decode("utf-8", errors="ignore")
+            raw = f.read()
+            text = raw.decode("utf-8", errors="ignore")
         except Exception:
             text = ""
+        # Keep raw text fallback
         RAG_CORPUS[f.name] = text
-        added.append({"file": f.name, "bytes": len(text)})
+
+        # NEW: chunk & index into Qdrant
+        chunks = chunk_text(f.name, text)
+        upsert_chunks(chunks)
+
+        added.append({"file": f.name, "bytes": len(text), "chunks": len(chunks)})
     return json.dumps({"ingested": added}, indent=2)
 
 # -----------------------
