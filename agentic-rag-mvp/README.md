@@ -62,3 +62,36 @@ Notes
 - If the server binary is not in `$HOME/src/llama.cpp/server`, point `LLAMA_DIR` to the folder containing `server` before running `scripts/run_hermes3.sh`.
 - On Apple Silicon you can build with Metal support; the server will show Metal device initialization in logs when using Metal.
 
+
+Client usage
+------------
+
+The repository contains a minimal stdlib Python client at `agentic-rag-mvp/scripts/clients/complete.py`.
+
+Basic usage (from repo root):
+
+```bash
+source .venv/bin/activate    # recommended
+python3 ./agentic-rag-mvp/scripts/clients/complete.py --prompt 'Hello Hermes3!'
+```
+
+Specify host/port or full URL:
+
+```bash
+python3 ./agentic-rag-mvp/scripts/clients/complete.py --host 127.0.0.1 --port 11434 --prompt 'Hi'
+python3 ./agentic-rag-mvp/scripts/clients/complete.py --url 'http://127.0.0.1:11434/completion' --prompt 'Hi'
+```
+
+Advanced flags:
+- `--timeout` seconds (default 10.0)
+- `--retries` number of attempts on network error (default 1)
+- `--raw` print raw JSON output
+- `--verbose` print extra metadata
+
+If you want to run the tests or CI locally, install the test dependency and run pytest:
+
+```bash
+python3 -m pip install -r requirements.txt
+python3 -m pytest -q
+```
+
