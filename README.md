@@ -60,3 +60,30 @@ Then open the Gradio UI (in another shell) and click "Get my Top 5". The Student
 Notes
 - The justifier is a lightweight placeholder: you can replace or extend it to call a local model server for richer language-generated pitches.
 - If `uvicorn` is not on your PATH, run it via the venv Python (`python -m uvicorn ...`) as shown above.
+
+Headless UI capture (optional)
+------------------------------
+If you want a scripted screenshot of the Gradio UI (useful for CI or demos) you can use Playwright:
+
+1. Install into the repo venv:
+
+```bash
+.venv/bin/python -m pip install playwright
+.venv/bin/python -m playwright install
+```
+
+2. Start backend + Gradio (with dev hook enabled if you want the error box):
+
+```bash
+export PYTHONPATH="$PWD/agentic-rag-mvp"
+ALLOW_DEV_HOOKS=1 RAG_FORCE_MALFORMED=1 .venv/bin/python -m uvicorn api.main:app --host 127.0.0.1 --port 8000 &
+.venv/bin/python agentic-rag-mvp/app/main.py &
+```
+
+3. Run the capture script:
+
+```bash
+.venv/bin/python scripts/capture_gradio.py
+```
+
+The script saves `gradio_capture.png` in the repo root by default.
