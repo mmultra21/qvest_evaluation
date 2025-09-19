@@ -11,12 +11,16 @@ from dotenv import load_dotenv
 
 import gradio as gr
 
+# Router + Web + Vector imports
+from app.router import route
+from app.web_search import serpapi_search
+from app.vector_store import search as vs_search, upsert_chunks
+
 # --- Server-side modules from your project ---
 from api.tools.recommender import rank_candidates
 from api.tools import rag
 from api.models_llm import JustifyResponse
 from api.routes import llm as llm_routes
-from app.vector_store import upsert_chunks
 
 # Optional: local Hermes-3 client (native llama.cpp endpoints)
 try:
@@ -91,7 +95,7 @@ class JustifyRequest(BaseModel):
     notes: Optional[str] = None
 
 # -----------------------
-# FastAPI endpoints (unchanged behavior)
+# API endpoints
 # -----------------------
 @app.get("/campaign/current")
 def campaign_current():
@@ -118,7 +122,7 @@ def justify(req: JustifyRequest):
         raise HTTPException(status_code=422, detail=str(e))
 
 # -----------------------
-# Helper functions & guardrails
+# Guardrails
 # -----------------------
 SAFE_BOOK_CHAT_RULES = (
     "Use age-appropriate language. Avoid spoilers unless asked. "
@@ -139,7 +143,6 @@ Prefer concise, factual answers. When the user uploads documents, use them as co
 If 'Allow web search' is on, you may suggest checking reputable sources; otherwise avoid web claims.
 """.strip()
 
-# --- Guardrails ---
 BLOCKED_KEYWORDS = [
     "adult content", "explicit", "contact me", "social media DMs", "nsfw",
 ]
@@ -148,7 +151,7 @@ import re
 BLOCKED_PATTERNS = {
     "email": re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"),
     "phone": re.compile(r"\b(?:\+?1[-.\s]?)?(?:\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4})\b"),
-    "url": re.compile(r"https?://\S+|www\.\S+"),
+    "url":   re.compile(r"https?://\S+|www\.\S+"),
 }
 
 def is_prompt_safe(text: str) -> Tuple[bool, str]:
@@ -167,8 +170,9 @@ def is_prompt_safe(text: str) -> Tuple[bool, str]:
         return False, "Please enter a more specific question about the book (e.g., theme, characters, reading level)."
     return True, "ok"
 
-# Leaderboard utils
-
+# -----------------------
+# Leaderboard utilities
+# -----------------------
 def record_reading(grade: int, student_name: str, catalog_id: str):
     grade = int(grade)
     READ_LOGS.setdefault(grade, {})
@@ -176,7 +180,6 @@ def record_reading(grade: int, student_name: str, catalog_id: str):
     student["count"] += 1
     student["books"].append(catalog_id)
 
-    # update prefs by category
     BOOK_PREFS.setdefault(grade, {})
     cat = BOOK_DB.get(catalog_id, {}).get("category", "other")
     BOOK_PREFS[grade][cat] = BOOK_PREFS[grade].get(cat, 0) + 1
@@ -192,10 +195,9 @@ def top_categories_for_grade(grade: int, k: int = 5):
     return ranked[:k]
 
 # -----------------------
-# Gradio UI Callbacks
+# Gradio callbacks
 # -----------------------
 def ui_student_get_overview(grade: int):
-    # Top 5 categories selected by students in this grade + last week's winner
     cats = top_categories_for_grade(grade, 5)
     winner = LAST_WEEK_WINNERS.get(grade)
     cats_table = [[c, n] for c, n in cats] or [["(no data)", 0]]
@@ -212,7 +214,6 @@ def ui_student_learn_book(book_id: str, question: str):
         return f"Unknown book id: {book_id}. Try one of: {', '.join(BOOK_DB.keys())}"
 
     context = json.dumps({"BOOK_INFO": info}, ensure_ascii=False)
-    # Plain prompt for completion fallback
     plain_prompt = (
         f"{STUDENT_SYSTEM_PROMPT}\n\n"
         f"Context: {context}\n\n"
@@ -232,7 +233,6 @@ def ui_student_learn_book(book_id: str, question: str):
         ]
         return llm.chat(messages, max_tokens=400, temperature=0.3)
     except Exception as e:
-        # Fallback if /chat is unavailable (e.g., 404 on llama.cpp without chat endpoint)
         if "404" in str(e) or "Not Found" in str(e):
             try:
                 return llm.completion(plain_prompt, max_tokens=400, temperature=0.3)
@@ -242,13 +242,13 @@ def ui_student_learn_book(book_id: str, question: str):
 
 def ui_student_log_read(grade: int, student_name: str, book_id: str):
     if not student_name.strip():
-        return "Please enter your name to log a book."
+        return "Please enter your name to log a book.", []
     if book_id not in BOOK_DB:
-        return f"Unknown book id: {book_id}"
+        return f"Unknown book id: {book_id}", []
     record_reading(grade, student_name.strip(), book_id)
     top5 = top_readers_by_grade(grade, 5)
     table = [[name, count, ", ".join(books)] for name, count, books in top5] or [["(no data)", 0, ""]]
-    return gr.update(value=f"Logged '{BOOK_DB[book_id]['title']}' for {student_name}!"), table
+    return f"Logged '{BOOK_DB[book_id]['title']}' for {student_name}!", table
 
 def ui_librarian_set_campaign(title: str, prize_rules: str, categories: List[str], start: str, end: str, seed_list: List[str]):
     CAMPAIGN.update({
@@ -274,64 +274,87 @@ def ui_librarian_pick_winner(grade: int):
     LAST_WEEK_WINNERS[grade] = {"student": name, "count": count, "books": books}
     return json.dumps({"winner": LAST_WEEK_WINNERS[grade]}, indent=2)
 
+# ---- Router-aware synthesis ----
+def synthesize_from_hits(question: str, hits):
+    ctx = []
+    for h in hits[:5]:
+        payload = getattr(h, "payload", {}) or {}
+        ctx.append((payload.get("text") or "")[:800])
+    return "\n\n".join(ctx)
+
 def ui_librarian_book_prompt(book_id: str, question: str, allow_web: bool):
     ok, msg = is_prompt_safe(question)
     if not ok:
         return msg
-    info = BOOK_DB.get(book_id)
-    context_chunks = []
-    if info:
-        context_chunks.append({"BOOK_INFO": info})
-    if RAG_CORPUS:
-        context_chunks.append({"RAG_SOURCES": list(RAG_CORPUS.keys())})
 
-    context = json.dumps(context_chunks, ensure_ascii=False)
+    plan = route(question, vs_threshold=0.40)
 
-    system = LIBRARIAN_SYSTEM_PROMPT + ("\nWeb routing: allowed" if allow_web else "\nWeb routing: disabled")
-    plain_prompt = (
-        f"{system}\n\nContext: {context}\n\nQuestion: {question}\n"
-        "If unsure, say so. If web routing is allowed, suggest reputable sources."
-    )
-
-    if llm is None:
-        return (
-            "(Local LLM not configured) Try enabling the Hermes-3 server. "
-            "Meanwhile, use precise questions like 'Give a 2-sentence summary and reading level.'"
+    # VECTOR path
+    if plan["route"] == "vector":
+        hits = plan["hits"]
+        context_text = synthesize_from_hits(question, hits)
+        system = LIBRARIAN_SYSTEM_PROMPT + "\nRouting: VectorStore"
+        prompt = (
+            f"{system}\n\nContext:\n{context_text}\n\n"
+            f"Question: {question}\n"
+            "Answer concisely. Cite snippets from the context if relevant."
         )
+        if llm is None:
+            return "(LLM not configured) Vector hits available."
+        try:
+            return llm.completion(prompt, max_tokens=600, temperature=0.2)
+        except Exception as e:
+            return f"[LLM error] {e}"
 
+    # WEB path
+    if plan["route"] == "web" and allow_web:
+        results = serpapi_search(question, num=5)
+        if not results:
+            return "Web search not available. Set SERPAPI_KEY or disable web routing."
+        snippets = "\n".join([f"- {r['title']}: {r.get('snippet','')} ({r.get('link','')})" for r in results])
+        system = LIBRARIAN_SYSTEM_PROMPT + "\nRouting: Web"
+        prompt = (
+            f"{system}\n\nWeb snippets:\n{snippets}\n\n"
+            f"Question: {question}\n"
+            "Synthesize a short, cautious answer from these snippets; if uncertain, say so and suggest verifying sources."
+        )
+        if llm is None:
+            # fallback: return the snippets for human review
+            return "Web snippets:\n" + snippets
+        try:
+            return llm.completion(prompt, max_tokens=600, temperature=0.3)
+        except Exception as e:
+            return f"[LLM error] {e}"
+
+    # LLM default path
+    system = LIBRARIAN_SYSTEM_PROMPT + "\nRouting: Direct LLM"
+    prompt = f"{system}\n\nQuestion: {question}\nBe concise; if unsure, say so."
+    if llm is None:
+        return "(LLM not configured) Direct LLM path."
     try:
-        messages = [
-            {"role": "system", "content": system},
-            {"role": "user", "content": f"Context: {context}\n\nQuestion: {question}"},
-        ]
-        return llm.chat(messages, max_tokens=600, temperature=0.2)
+        return llm.completion(prompt, max_tokens=500, temperature=0.3)
     except Exception as e:
-        if "404" in str(e) or "Not Found" in str(e):
-            try:
-                return llm.completion(plain_prompt, max_tokens=600, temperature=0.2)
-            except Exception as e2:
-                return f"[LLM error] {e2}"
         return f"[LLM error] {e}"
 
-def ui_rag_upload(files: list[gr.File]) -> str:
-    def chunk_text(name: str, text: str, max_len: int = 800, overlap: int = 100):
-        chunks = []
-        i = 0
-        idx = 0
-        while i < len(text):
-            chunk = text[i:i+max_len]
-            chunks.append({
-                "id": f"{name}-{idx}",
-                "text": chunk,
-                "meta": {"source": name}
-            })
-            i += max_len - overlap
-            idx += 1
-        return chunks
+# ---- RAG upload + Qdrant indexing ----
+def chunk_text(name: str, text: str, max_len: int = 800, overlap: int = 100):
+    chunks = []
+    i = 0
+    idx = 0
+    while i < len(text):
+        chunk = text[i:i+max_len]
+        chunks.append({
+            "id": f"{name}-{idx}",
+            "text": chunk,
+            "meta": {"source": name}
+        })
+        i += max_len - overlap
+        idx += 1
+    return chunks
 
+def ui_rag_upload(files: list[gr.File]) -> str:
     if not files:
         return json.dumps({"message": "No files provided."}, indent=2)
-
     added = []
     for f in files:
         try:
@@ -339,7 +362,7 @@ def ui_rag_upload(files: list[gr.File]) -> str:
             text = raw.decode("utf-8", errors="ignore")
         except Exception:
             text = ""
-        # Keep raw text fallback
+        # keep for simple fallback
         RAG_CORPUS[f.name] = text
 
         # NEW: chunk & index into Qdrant
@@ -437,10 +460,11 @@ with gr.Blocks(title="Agentic RAG MVP — Student & Librarian") as demo:
             rag_status = gr.Code(label="Ingestion Status", language="json")
             ingest_btn.click(ui_rag_upload, inputs=[rag_files], outputs=[rag_status])
 
-# Mount Gradio into FastAPI
+# Mount Gradio into FastAPI so UI and API live together
 from gradio.routes import mount_gradio_app
 app = mount_gradio_app(app, demo, path="/")
 
 if __name__ == "__main__":
+    # Run the combined FastAPI + Gradio app
     import uvicorn
     uvicorn.run(app, host=os.getenv("HOST", "127.0.0.1"), port=int(os.getenv("PORT", "8000")))
