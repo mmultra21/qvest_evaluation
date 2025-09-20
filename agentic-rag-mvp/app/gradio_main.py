@@ -2,43 +2,88 @@
 from __future__ import annotations
 
 import os
+import io
 import json
+import re
 from typing import List, Dict, Any, Optional, Tuple
 
+from dotenv import load_dotenv
+load_dotenv()  # load .env from project root early
+
+# --- FastAPI base app (API + Gradio mounted) ---
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
-from dotenv import load_dotenv
 
 import gradio as gr
 
-# Router + Web + Vector imports
-from app.router import route
-from app.web_search import serpapi_search
-from app.vector_store import search as vs_search, upsert_chunks
-
-# --- Server-side modules from your project ---
+# --- Project modules ---
+from api.routes import llm as llm_routes
 from api.tools.recommender import rank_candidates
 from api.tools import rag
 from api.models_llm import JustifyResponse
-from api.routes import llm as llm_routes
 
-# Optional: local Hermes-3 client (native llama.cpp endpoints)
+# Vector store & web
+from app.vector_store import upsert_chunks, stats as vs_stats, search as vs_search
+from app.web_search import serpapi_search
+from app.web_search import format_results_bullets  # result -> bullet list formatter
+
+# ---------- LLM (Hermes-3 via llama.cpp) ----------
+import requests
+import json as _json
+
+LLM_URL = os.getenv("LLM_URL", "http://127.0.0.1:11434").rstrip("/")
+
+class _FallbackLLM:
+    """Minimal llama.cpp client: prefers /chat; falls back to /completion with Assistant cue."""
+    def __init__(self, base_url: str):
+        self.base = base_url
+
+    def completion(self, prompt: str, max_tokens: int = 512, temperature: float = 0.2):
+        # Ensure clear assistant turn and sensible stop sequences
+        prompt = prompt.rstrip() + "\nAssistant:"
+        payload = {
+            "prompt": prompt,
+            "n_predict": max_tokens,
+            "temperature": temperature,
+            "cache_prompt": True,
+            "stop": ["\nUser:", "User:", "</s>", "<|eot_id|>", "<|end|>"],
+        }
+        r = requests.post(f"{self.base}/completion", json=payload, timeout=120)
+        r.raise_for_status()
+        data = r.json()
+        return data.get("content") or data.get("response") or _json.dumps(data)
+
+    def chat(self, messages, max_tokens: int = 512, temperature: float = 0.2):
+        payload = {
+            "messages": messages,
+            "temperature": temperature,
+            "n_predict": max_tokens,
+        }
+        r = requests.post(f"{self.base}/chat", json=payload, timeout=120)
+        if r.status_code == 404:
+            # Synthesize a completion-style prompt
+            sys = "\n".join(m["content"] for m in messages if m["role"] == "system")
+            usr = "\n".join(m["content"] for m in messages if m["role"] == "user")
+            fused = (sys + "\n\nUser:\n" + usr + "\nAssistant:").strip()
+            return self.completion(fused, max_tokens=max_tokens, temperature=temperature)
+        r.raise_for_status()
+        data = r.json()
+        if isinstance(data, dict) and isinstance(data.get("message"), dict):
+            return data["message"].get("content") or _json.dumps(data)
+        return data.get("content") or data.get("response") or _json.dumps(data)
+
+# Prefer project client if available
 try:
-    from app.llm_client import client as llm
+    from api.models_llm import LLMClient as _ProjectLLM
+    llm = _ProjectLLM(base_url=LLM_URL)
 except Exception:
-    llm = None
+    llm = _FallbackLLM(LLM_URL)
 
-load_dotenv()
-
-# -----------------------
-# FastAPI app + routes
-# -----------------------
+# ---------- FastAPI app ----------
 app = FastAPI(title="Agentic RAG MVP API")
 app.include_router(llm_routes.router)
 
-# -----------------------
-# In-memory demo stores (replace with DB later)
-# -----------------------
+# ---------- In-memory demo data ----------
 CAMPAIGN: Dict[str, Any] = {
     "title": "Reading Week Spotlight",
     "prize_rules": "Prize for most books read in the week by grade.",
@@ -48,15 +93,10 @@ CAMPAIGN: Dict[str, Any] = {
     "end_date": None,
 }
 
-# READ_LOGS[grade] = { student_name: {"count": int, "books": [catalog_id, ...]} }
-READ_LOGS: Dict[int, Dict[str, Dict[str, Any]]] = {}
-# LAST_WEEK_WINNERS[grade] = {"student": str, "count": int}
-LAST_WEEK_WINNERS: Dict[int, Dict[str, Any]] = {}
+READ_LOGS: Dict[int, Dict[str, Dict[str, Any]]] = {}       # per-grade reading logs
+LAST_WEEK_WINNERS: Dict[int, Dict[str, Any]] = {}          # per-grade winners
+BOOK_PREFS: Dict[int, Dict[str, int]] = {}                 # per-grade category counts
 
-# BOOK_PREFS[grade] = {category: count}
-BOOK_PREFS: Dict[int, Dict[str, int]] = {}
-
-# Minimal demo catalog for lookups (replace with real catalog / RAG retrieval)
 BOOK_DB: Dict[str, Dict[str, Any]] = {
     "bk1": {"title": "Trail Adventures", "author": "K. Jay", "category": "adventure", "lexile": 750},
     "bk2": {"title": "Oceans Explained", "author": "R. Lee", "category": "science", "lexile": 820},
@@ -66,12 +106,10 @@ BOOK_DB: Dict[str, Dict[str, Any]] = {
     "bk6": {"title": "Forest Tales", "author": "S. Wilde", "category": "fantasy", "lexile": 720},
 }
 
-# Simple RAG data bucket (filenames -> text)
+# Keep raw text for inspect/debug (filename -> text)
 RAG_CORPUS: Dict[str, str] = {}
 
-# -----------------------
-# Pydantic models (from your main.py)
-# -----------------------
+# ---------- Pydantic models for API ----------
 class RecommendRequest(BaseModel):
     grade: int
     interests: List[str] = Field(default_factory=list)
@@ -94,9 +132,7 @@ class JustifyRequest(BaseModel):
     student: Student
     notes: Optional[str] = None
 
-# -----------------------
-# API endpoints
-# -----------------------
+# ---------- API endpoints ----------
 @app.get("/campaign/current")
 def campaign_current():
     return CAMPAIGN
@@ -121,13 +157,10 @@ def justify(req: JustifyRequest):
     except Exception as e:
         raise HTTPException(status_code=422, detail=str(e))
 
-# -----------------------
-# Guardrails
-# -----------------------
+# ---------- Guardrails ----------
 SAFE_BOOK_CHAT_RULES = (
     "Use age-appropriate language. Avoid spoilers unless asked. "
-    "Never provide personal contact links. For external info, cite general sources and suggest checking with a librarian. "
-    "Do not invent facts; if unsure, say so."
+    "Never provide personal contact links. Do not invent facts; if unsure, say so."
 )
 
 STUDENT_SYSTEM_PROMPT = f"""
@@ -140,14 +173,13 @@ LIBRARIAN_SYSTEM_PROMPT = f"""
 You are Hermes-3 assisting a librarian with reading campaigns, book summaries, and safe recommendations.
 Rules: {SAFE_BOOK_CHAT_RULES}
 Prefer concise, factual answers. When the user uploads documents, use them as context.
-If 'Allow web search' is on, you may suggest checking reputable sources; otherwise avoid web claims.
+Always answer as a single concise paragraph unless the user asks for a list or multiple items.
 """.strip()
 
 BLOCKED_KEYWORDS = [
-    "adult content", "explicit", "contact me", "social media DMs", "nsfw",
+    "adult content", "explicit", "contact me", "social media dms", "nsfw",
 ]
 
-import re
 BLOCKED_PATTERNS = {
     "email": re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"),
     "phone": re.compile(r"\b(?:\+?1[-.\s]?)?(?:\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4})\b"),
@@ -170,9 +202,7 @@ def is_prompt_safe(text: str) -> Tuple[bool, str]:
         return False, "Please enter a more specific question about the book (e.g., theme, characters, reading level)."
     return True, "ok"
 
-# -----------------------
-# Leaderboard utilities
-# -----------------------
+# ---------- Leaderboard utils ----------
 def record_reading(grade: int, student_name: str, catalog_id: str):
     grade = int(grade)
     READ_LOGS.setdefault(grade, {})
@@ -194,9 +224,7 @@ def top_categories_for_grade(grade: int, k: int = 5):
     ranked = sorted(prefs.items(), key=lambda kv: kv[1], reverse=True)
     return ranked[:k]
 
-# -----------------------
-# Gradio callbacks
-# -----------------------
+# ---------- Student UI callbacks ----------
 def ui_student_get_overview(grade: int):
     cats = top_categories_for_grade(grade, 5)
     winner = LAST_WEEK_WINNERS.get(grade)
@@ -214,18 +242,6 @@ def ui_student_learn_book(book_id: str, question: str):
         return f"Unknown book id: {book_id}. Try one of: {', '.join(BOOK_DB.keys())}"
 
     context = json.dumps({"BOOK_INFO": info}, ensure_ascii=False)
-    plain_prompt = (
-        f"{STUDENT_SYSTEM_PROMPT}\n\n"
-        f"Context: {context}\n\n"
-        f"Question: {question}"
-    )
-
-    if llm is None:
-        return (
-            f"(Local LLM not configured) Here's what I can share about '{info['title']}' by {info['author']} "
-            f"in {info['category']} (Lexile {info['lexile']}): Try asking about themes, characters, or difficulty."
-        )
-
     try:
         messages = [
             {"role": "system", "content": STUDENT_SYSTEM_PROMPT},
@@ -233,12 +249,12 @@ def ui_student_learn_book(book_id: str, question: str):
         ]
         return llm.chat(messages, max_tokens=400, temperature=0.3)
     except Exception as e:
-        if "404" in str(e) or "Not Found" in str(e):
-            try:
-                return llm.completion(plain_prompt, max_tokens=400, temperature=0.3)
-            except Exception as e2:
-                return f"[LLM error] {e2}"
-        return f"[LLM error] {e}"
+        # fallback to completion
+        plain_prompt = f"{STUDENT_SYSTEM_PROMPT}\n\nContext: {context}\n\nQuestion: {question}"
+        try:
+            return llm.completion(plain_prompt, max_tokens=400, temperature=0.3)
+        except Exception as e2:
+            return f"[LLM error] {e2}"
 
 def ui_student_log_read(grade: int, student_name: str, book_id: str):
     if not student_name.strip():
@@ -250,31 +266,7 @@ def ui_student_log_read(grade: int, student_name: str, book_id: str):
     table = [[name, count, ", ".join(books)] for name, count, books in top5] or [["(no data)", 0, ""]]
     return f"Logged '{BOOK_DB[book_id]['title']}' for {student_name}!", table
 
-def ui_librarian_set_campaign(title: str, prize_rules: str, categories: List[str], start: str, end: str, seed_list: List[str]):
-    CAMPAIGN.update({
-        "title": title or CAMPAIGN["title"],
-        "prize_rules": prize_rules or CAMPAIGN["prize_rules"],
-        "categories": categories or CAMPAIGN["categories"],
-        "start_date": start or None,
-        "end_date": end or None,
-        "seed_list": seed_list or CAMPAIGN["seed_list"],
-    })
-    return json.dumps(CAMPAIGN, indent=2)
-
-def ui_librarian_leaderboard(grade: int):
-    top5 = top_readers_by_grade(grade, 5)
-    table = [[name, count, ", ".join(books)] for name, count, books in top5] or [["(no data)", 0, ""]]
-    return table
-
-def ui_librarian_pick_winner(grade: int):
-    top5 = top_readers_by_grade(grade, 1)
-    if not top5:
-        return json.dumps({"message": "No readers yet."}, indent=2)
-    name, count, books = top5[0]
-    LAST_WEEK_WINNERS[grade] = {"student": name, "count": count, "books": books}
-    return json.dumps({"winner": LAST_WEEK_WINNERS[grade]}, indent=2)
-
-# ---- Router-aware synthesis ----
+# ---------- Librarian research helpers ----------
 def synthesize_from_hits(question: str, hits):
     ctx = []
     for h in hits[:5]:
@@ -282,105 +274,287 @@ def synthesize_from_hits(question: str, hits):
         ctx.append((payload.get("text") or "")[:800])
     return "\n\n".join(ctx)
 
-def ui_librarian_book_prompt(book_id: str, question: str, allow_web: bool):
+def _format_snippets(hits, k: int = 3, char_limit: int = 260) -> str:
+    lines = []
+    for h in (hits or [])[:k]:
+        payload = getattr(h, "payload", {}) or {}
+        src = payload.get("source") or payload.get("meta", {}).get("source") or "unknown"
+        txt_full = (payload.get("text") or "")
+        txt = txt_full[:char_limit].replace("\n", " ").strip()
+        tail = "…" if len(txt_full) > char_limit else ""
+        lines.append(f"- [{h.score:.3f}] {src}: {txt}{tail}")
+    return "\n".join(lines) if lines else "(no snippets)"
+
+# --- Recency-aware routing ---
+RECENCY_TRIGGERS = {
+    "as of today", "today", "right now", "currently", "current", "latest",
+    "who is", "who’s", "who's", "in charge of", "ceo", "director", "register of copyrights",
+    "head of", "chair", "president", "governor", "mayor", "this week", "this month", "2024", "2025",
+}
+
+def wants_freshness(q: str) -> bool:
+    ql = (q or "").lower()
+    return any(t in ql for t in RECENCY_TRIGGERS)
+
+def route_recency_aware(question: str, allow_web: bool, vs_threshold: float = 0.40):
+    """
+    Minimal router:
+    - If allow_web and the question looks time-sensitive -> web
+    - Else vector if best score >= threshold
+    - Else web if allowed
+    - Else direct llm
+    """
+    hits = vs_search(question, top_k=5)
+    best_score = hits[0].score if hits else 0.0
+
+    if allow_web and wants_freshness(question):
+        return {"route": "web", "hits": hits, "best_score": best_score}
+
+    if best_score >= vs_threshold:
+        return {"route": "vector", "hits": hits, "best_score": best_score}
+
+    if allow_web:
+        return {"route": "web", "hits": hits, "best_score": best_score}
+
+    return {"route": "llm", "hits": hits, "best_score": best_score}
+
+# ---------- Librarian main prompt (router-aware, narrative + snippets) ----------
+def ui_librarian_book_prompt(book_id: str, question: str, allow_web: bool, show_snippets: bool = True, debug: bool = False):
     ok, msg = is_prompt_safe(question)
     if not ok:
         return msg
 
-    plan = route(question, vs_threshold=0.40)
+    plan = route_recency_aware(question, allow_web=allow_web, vs_threshold=0.40)
+    route_used = plan["route"]
+    hits = plan["hits"]
+
+    style = (
+        "Answer in a concise narrative paragraph (3–6 sentences). "
+        "Avoid Q&A headings. If the question is time-sensitive, include specific dates. "
+        "If uncertain, say so briefly."
+    )
 
     # VECTOR path
-    if plan["route"] == "vector":
-        hits = plan["hits"]
+    if route_used == "vector":
         context_text = synthesize_from_hits(question, hits)
         system = LIBRARIAN_SYSTEM_PROMPT + "\nRouting: VectorStore"
         prompt = (
-            f"{system}\n\nContext:\n{context_text}\n\n"
+            f"{system}\n\n{style}\n\n"
+            f"Context:\n{context_text}\n\n"
             f"Question: {question}\n"
-            "Answer concisely. Cite snippets from the context if relevant."
+            "Write a single concise paragraph grounded in the context."
         )
-        if llm is None:
-            return "(LLM not configured) Vector hits available."
         try:
-            return llm.completion(prompt, max_tokens=600, temperature=0.2)
+            answer = llm.completion(prompt, max_tokens=600, temperature=0.2)
         except Exception as e:
             return f"[LLM error] {e}"
 
+        if show_snippets:
+            answer += "\n\n---\nTop context snippets:\n" + _format_snippets(hits, k=3, char_limit=260)
+        if debug:
+            try:
+                best = float(plan.get('best_score') or 0.0)
+            except Exception:
+                best = 0.0
+            answer += f"\n\n---\n[debug] route=vector best_score={best:.3f}"
+        return answer
+
     # WEB path
-    if plan["route"] == "web" and allow_web:
-        results = serpapi_search(question, num=5)
-        if not results:
-            return "Web search not available. Set SERPAPI_KEY or disable web routing."
-        snippets = "\n".join([f"- {r['title']}: {r.get('snippet','')} ({r.get('link','')})" for r in results])
-        system = LIBRARIAN_SYSTEM_PROMPT + "\nRouting: Web"
-        prompt = (
-            f"{system}\n\nWeb snippets:\n{snippets}\n\n"
-            f"Question: {question}\n"
-            "Synthesize a short, cautious answer from these snippets; if uncertain, say so and suggest verifying sources."
-        )
-        if llm is None:
-            # fallback: return the snippets for human review
-            return "Web snippets:\n" + snippets
+    if route_used == "web":
         try:
-            return llm.completion(prompt, max_tokens=600, temperature=0.3)
+            # Try targeted official site first for leadership/role queries
+            ql = (question or "").lower()
+            prefer_site = None
+            if any(t in ql for t in ["copyright office", "register of copyrights", "copyright.gov"]):
+                prefer_site = "copyright.gov"
+
+            results = []
+            if prefer_site:
+                results = serpapi_search(question, num=5, site=prefer_site)
+            if not results:
+                results = serpapi_search(question, num=5)
+        except Exception as e:
+            return f"Web search error: {e}"
+
+        if not results:
+            if hits:
+                snippet = (hits[0].payload or {}).get("text", "")[:200].replace("\n", " ")
+                return ("(Web search returned no results; showing local context instead) "
+                        f"{snippet}…")
+            return "Web search returned no results."
+
+        web_snips = "\n".join([f"- {r['title']}: {r.get('snippet','')} ({r.get('link','')}) [{r.get('source','web')}]" for r in results])
+        system = (
+            LIBRARIAN_SYSTEM_PROMPT
+            + "\nRouting: Web\n"
+            + "Web access is explicitly authorized for this question. "
+              "Use the provided web snippets as evidence. Do not refuse web use."
+        )
+        prompt = (
+            f"{system}\n\n{style}\n\n"
+            f"Web snippets:\n{web_snips}\n\n"
+            f"Question: {question}\n"
+            "Synthesize a short, cautious paragraph from these snippets; include specific names/dates when relevant. "
+            "If uncertain, say so briefly and suggest verifying sources."
+        )
+        try:
+            answer = llm.completion(prompt, max_tokens=600, temperature=0.3)
         except Exception as e:
             return f"[LLM error] {e}"
+
+        if debug:
+            try:
+                best = float(plan.get('best_score') or 0.0)
+            except Exception:
+                best = 0.0
+            sources = [r.get('source', 'web') for r in results]
+            bullets = ""
+            try:
+                bullets = format_results_bullets(results)
+            except Exception:
+                bullets = web_snips
+            answer += (
+                f"\n\n---\n[debug] route=web best_score={best:.3f} "
+                f"web_hits={len(results)} surfaces={sorted(set(sources))}\n\n{bullets}"
+            )
+        return answer
 
     # LLM default path
     system = LIBRARIAN_SYSTEM_PROMPT + "\nRouting: Direct LLM"
-    prompt = f"{system}\n\nQuestion: {question}\nBe concise; if unsure, say so."
-    if llm is None:
-        return "(LLM not configured) Direct LLM path."
+    prompt = f"{system}\n\n{style}\n\nQuestion: {question}\nWrite one concise paragraph."
     try:
-        return llm.completion(prompt, max_tokens=500, temperature=0.3)
+        answer = llm.completion(prompt, max_tokens=500, temperature=0.3)
     except Exception as e:
         return f"[LLM error] {e}"
+    if debug:
+        try:
+            best = float(plan.get('best_score') or 0.0)
+        except Exception:
+            best = 0.0
+        answer += f"\n\n---\n[debug] route=llm best_score={best:.3f}"
+    return answer
 
-# ---- RAG upload + Qdrant indexing ----
-def chunk_text(name: str, text: str, max_len: int = 800, overlap: int = 100):
+# ---------- RAG upload handlers ----------
+TEXT_EXTS = {".txt", ".md", ".csv", ".json"}
+DOCX_EXT = ".docx"
+PDF_EXT = ".pdf"
+
+def is_texty(name: str) -> bool:
+    _, ext = os.path.splitext(name.lower())
+    return ext in TEXT_EXTS
+
+def _read_file_by_path(path: str) -> Tuple[str, str]:
+    """Return (name, text) for supported file types."""
+    name = os.path.basename(path)
+    ext = os.path.splitext(name.lower())[1]
+    if ext in TEXT_EXTS:
+        with open(path, "rb") as f:
+            raw = f.read()
+        return name, raw.decode("utf-8", errors="ignore")
+    if ext == DOCX_EXT:
+        try:
+            import docx2txt
+        except Exception as e:
+            raise RuntimeError("docx2txt is required for .docx ingestion (pip install docx2txt)") from e
+        text = docx2txt.process(path) or ""
+        return name, text
+    if ext == PDF_EXT:
+        try:
+            import pdfplumber
+        except Exception as e:
+            raise RuntimeError("pdfplumber is required for .pdf ingestion (pip install pdfplumber)") from e
+        text_parts = []
+        with pdfplumber.open(path) as pdf:
+            for page in pdf.pages:
+                txt = page.extract_text() or ""
+                if txt.strip():
+                    text_parts.append(txt)
+        return name, "\n\n".join(text_parts)
+    raise RuntimeError("unsupported extension (use .txt/.md/.csv/.json/.docx/.pdf)")
+
+def chunk_text(name: str, text: str, max_len: int = 800, overlap: int = 100, min_len: int = 40):
     chunks = []
     i = 0
     idx = 0
     while i < len(text):
-        chunk = text[i:i+max_len]
-        chunks.append({
-            "id": f"{name}-{idx}",
-            "text": chunk,
-            "meta": {"source": name}
-        })
+        piece = text[i:i+max_len]
+        if len(piece.strip()) >= min_len:
+            chunks.append({
+                "id": f"{name}-{idx}",
+                "text": piece,
+                "meta": {"source": name}
+            })
+            idx += 1
         i += max_len - overlap
-        idx += 1
     return chunks
 
-def ui_rag_upload(files: list[gr.File]) -> str:
-    if not files:
+def ui_rag_upload(filepaths: list[str] | None) -> str:
+    if not filepaths:
         return json.dumps({"message": "No files provided."}, indent=2)
-    added = []
-    for f in files:
+
+    files = filepaths if isinstance(filepaths, list) else [filepaths]
+    report = {"ingested": [], "skipped": []}
+
+    for path in files:
         try:
-            raw = f.read()
-            text = raw.decode("utf-8", errors="ignore")
-        except Exception:
-            text = ""
-        # keep for simple fallback
-        RAG_CORPUS[f.name] = text
+            name, text = _read_file_by_path(path)
+        except Exception as e:
+            report["skipped"].append({"file": os.path.basename(str(path)), "reason": str(e)})
+            continue
 
-        # NEW: chunk & index into Qdrant
-        chunks = chunk_text(f.name, text)
-        upsert_chunks(chunks)
+        if not text.strip():
+            report["skipped"].append({"file": name, "reason": "empty content"})
+            continue
 
-        added.append({"file": f.name, "bytes": len(text), "chunks": len(chunks)})
-    return json.dumps({"ingested": added}, indent=2)
+        # keep raw text for fallback inspect
+        RAG_CORPUS[name] = text
 
-# -----------------------
-# Build Gradio UI
-# -----------------------
+        chunks = chunk_text(name, text)
+        try:
+            n = upsert_chunks(chunks)
+            if n > 0:
+                report["ingested"].append({"file": name, "bytes": len(text.encode("utf-8", errors="ignore")), "chunks": n})
+            else:
+                report["skipped"].append({"file": name, "reason": "no valid chunks"})
+        except Exception as e:
+            report["skipped"].append({"file": name, "reason": f"qdrant error: {e}"})
+
+    return json.dumps(report, indent=2)
+
+# ---------- Admin helpers ----------
+def web_status() -> str:
+    """Return JSON showing whether SERPAPI_KEY is set and if a quick ping works."""
+    key = os.getenv("SERPAPI_KEY")
+    if not key:
+        return json.dumps({
+            "serpapi": "missing",
+            "hint": "Add SERPAPI_KEY to .env or export it in your shell; restart the app."
+        }, indent=2)
+
+    masked = (key[:4] + "..." + key[-4:]) if len(key) >= 8 else "***"
+    try:
+        rs = serpapi_search("site:copyright.gov Register of Copyrights", num=1)
+        ok = bool(rs)
+        return json.dumps({
+            "serpapi": "present",
+            "key": masked,
+            "ping": "ok" if ok else "no-results"
+        }, indent=2)
+    except Exception as e:
+        return json.dumps({
+            "serpapi": "present",
+            "key": masked,
+            "ping": "error",
+            "error": str(e)
+        }, indent=2)
+
+# ---------- Build Gradio UI ----------
 with gr.Blocks(title="Agentic RAG MVP — Student & Librarian") as demo:
     gr.Markdown(
         """
         ## 📚 Reading Campaign — Student & Librarian
         - **Student tab**: check popular categories by grade, last week's winner, ask safe questions about books, and log your reading.
-        - **Librarian tab**: set the weekly campaign, see top readers by grade, auto-pick winners, ask research questions (with optional web routing), and ingest RAG sources.
+        - **Librarian tab**: set the weekly campaign, see top readers by grade, auto-pick winners, router-aware research (with optional web routing), ingest RAG sources, and view Qdrant stats.
         """
     )
 
@@ -398,15 +572,15 @@ with gr.Blocks(title="Agentic RAG MVP — Student & Librarian") as demo:
         with gr.Row():
             s_book = gr.Dropdown(choices=list(BOOK_DB.keys()), value="bk2", label="Book ID")
             s_q = gr.Textbox(label="Your question", placeholder="e.g., What is the main theme? Is this age-appropriate for grade 5?", lines=2)
-        s_ask = gr.Button("Ask")
-        s_answer = gr.Textbox(label="Answer", lines=6)
-        gr.Markdown(
-            "**Safety & tips:** Keep questions specific (themes, characters, reading level). Avoid personal info, external links, or spoilers unless you ask for them."
-        )
-        gr.Markdown(
-            "**Prohibited use:** Do not share personal contact info (emails, phone numbers), do not request or post links, avoid NSFW topics, and do not ask the model to contact you outside this app."
-        )
-        # Button click and Enter-to-submit
+            s_ask = gr.Button("Ask")
+            s_answer = gr.Textbox(label="Answer", lines=6)
+
+            # NEW: Clear button to reset question and answer fields
+            s_clear = gr.Button("Clear")
+            s_clear.click(lambda: ("", ""), inputs=None, outputs=[s_q, s_answer])
+
+        gr.Markdown("**Safety & tips:** Keep questions specific (themes, characters, reading level). Avoid personal info, external links, or spoilers unless you ask for them.")
+        gr.Markdown("**Prohibited use:** Do not share personal contact info (emails, phone numbers), do not request or post links, avoid NSFW topics, and do not ask the model to contact you outside this app.")
         s_ask.click(ui_student_learn_book, inputs=[s_book, s_q], outputs=[s_answer])
         s_q.submit(ui_student_learn_book, inputs=[s_book, s_q], outputs=[s_answer])
 
@@ -425,46 +599,84 @@ with gr.Blocks(title="Agentic RAG MVP — Student & Librarian") as demo:
         with gr.Accordion("Campaign Setup", open=True):
             l_title = gr.Textbox(label="Campaign Title", value=CAMPAIGN["title"])
             l_prize = gr.Textbox(label="Prize Rules", value=CAMPAIGN["prize_rules"])
-            l_categories = gr.CheckboxGroup(choices=list({*CAMPAIGN["categories"], *[b.get("category", "other") for b in BOOK_DB.values()]}),
-                                            value=CAMPAIGN["categories"], label="Categories")
+            l_categories = gr.CheckboxGroup(
+                choices=list({*CAMPAIGN["categories"], *[b.get("category", "other") for b in BOOK_DB.values()]}),
+                value=CAMPAIGN["categories"],
+                label="Categories"
+            )
             with gr.Row():
                 l_start = gr.Textbox(label="Start Date (YYYY-MM-DD)")
                 l_end = gr.Textbox(label="End Date (YYYY-MM-DD)")
             l_seed = gr.CheckboxGroup(choices=list(BOOK_DB.keys()), value=CAMPAIGN["seed_list"], label="Featured Seed Books")
             apply_btn = gr.Button("Apply Campaign Settings")
             l_campaign_json = gr.Code(label="Current Campaign JSON", language="json")
-            apply_btn.click(ui_librarian_set_campaign, inputs=[l_title, l_prize, l_categories, l_start, l_end, l_seed], outputs=[l_campaign_json])
+            def _ui_librarian_set_campaign(title: str, prize_rules: str, categories: List[str], start: str, end: str, seed_list: List[str]):
+                CAMPAIGN.update({
+                    "title": title or CAMPAIGN["title"],
+                    "prize_rules": prize_rules or CAMPAIGN["prize_rules"],
+                    "categories": categories or CAMPAIGN["categories"],
+                    "start_date": start or None,
+                    "end_date": end or None,
+                    "seed_list": seed_list or CAMPAIGN["seed_list"],
+                })
+                return json.dumps(CAMPAIGN, indent=2)
+            apply_btn.click(_ui_librarian_set_campaign, inputs=[l_title, l_prize, l_categories, l_start, l_end, l_seed], outputs=[l_campaign_json])
 
         with gr.Accordion("Leaderboards & Winners", open=True):
             l_grade = gr.Slider(1, 12, value=5, step=1, label="Grade")
             l_refresh = gr.Button("Refresh Leaderboard")
             l_table = gr.Dataframe(headers=["Student", "Count", "Books"], row_count=5, interactive=False)
-            l_refresh.click(ui_librarian_leaderboard, inputs=[l_grade], outputs=[l_table])
+            l_refresh.click(lambda g: [[n, c, ", ".join(b)] for n, c, b in top_readers_by_grade(g, 5)] or [["(no data)", 0, ""]], inputs=[l_grade], outputs=[l_table])
 
             pick_btn = gr.Button("Pick Weekly Winner (by grade)")
             l_winner = gr.Code(label="Winner JSON", language="json")
-            pick_btn.click(ui_librarian_pick_winner, inputs=[l_grade], outputs=[l_winner])
+            def _ui_librarian_pick_winner(grade: int):
+                top5 = top_readers_by_grade(grade, 1)
+                if not top5:
+                    return json.dumps({"message": "No readers yet."}, indent=2)
+                name, count, books = top5[0]
+                LAST_WEEK_WINNERS[grade] = {"student": name, "count": count, "books": books}
+                return json.dumps({"winner": LAST_WEEK_WINNERS[grade]}, indent=2)
+            pick_btn.click(_ui_librarian_pick_winner, inputs=[l_grade], outputs=[l_winner])
 
         with gr.Accordion("Research Assistant (Prompt)", open=False):
             with gr.Row():
                 l_book = gr.Dropdown(choices=list(BOOK_DB.keys()), value="bk2", label="(Optional) Book ID")
-                l_allow_web = gr.Checkbox(label="Allow web routing (suggest web sources)", value=False)
-            l_q = gr.Textbox(label="Your question", placeholder="e.g., Provide a 3-sentence summary and reading level guidance.", lines=2)
+                l_allow_web = gr.Checkbox(label="Allow web routing (suggest web sources)", value=True)
+                l_show_snips = gr.Checkbox(label="Show context snippets", value=True)
+                l_debug = gr.Checkbox(label="Show routing debug", value=False)
+            l_q = gr.Textbox(label="Your question", placeholder="e.g., As of today, who is the Register of Copyrights?", lines=2)
             l_ask = gr.Button("Ask")
-            l_ans = gr.Textbox(label="Answer", lines=10)
-            l_ask.click(ui_librarian_book_prompt, inputs=[l_book, l_q, l_allow_web], outputs=[l_ans])
+            l_ans = gr.Textbox(label="Answer", lines=12)
+            l_ask.click(ui_librarian_book_prompt, inputs=[l_book, l_q, l_allow_web, l_show_snips, l_debug], outputs=[l_ans])
+
+            # NEW: Clear button for Research Assistant
+            l_clear = gr.Button("Clear")
+            l_clear.click(lambda: ("", ""), inputs=None, outputs=[l_q, l_ans])
 
         with gr.Accordion("Agentic RAG — Upload Sources", open=False):
-            rag_files = gr.Files(label="Upload text/CSV/JSON files from other schools, publications, etc.")
+            rag_files = gr.Files(label="Upload text/CSV/JSON/DOCX/PDF files", type="filepath")
             ingest_btn = gr.Button("Ingest to RAG (demo)")
             rag_status = gr.Code(label="Ingestion Status", language="json")
             ingest_btn.click(ui_rag_upload, inputs=[rag_files], outputs=[rag_status])
+
+            # NEW: Clear ingestion status
+            rag_clear = gr.Button("Clear Ingestion Status")
+            rag_clear.click(lambda: "", inputs=None, outputs=[rag_status])
+
+        with gr.Accordion("Admin — Vector Store Stats", open=False):
+            stats_btn = gr.Button("Refresh Stats")
+            stats_box = gr.Code(label="Qdrant / Embedding Stats", language="json")
+            stats_btn.click(lambda: json.dumps(vs_stats(), indent=2), inputs=[], outputs=[stats_box])
+
+            web_btn = gr.Button("Check Web (SerpAPI)")
+            web_box = gr.Code(label="Web Status", language="json")
+            web_btn.click(lambda: web_status(), outputs=[web_box])
 
 # Mount Gradio into FastAPI so UI and API live together
 from gradio.routes import mount_gradio_app
 app = mount_gradio_app(app, demo, path="/")
 
 if __name__ == "__main__":
-    # Run the combined FastAPI + Gradio app
     import uvicorn
     uvicorn.run(app, host=os.getenv("HOST", "127.0.0.1"), port=int(os.getenv("PORT", "8000")))
