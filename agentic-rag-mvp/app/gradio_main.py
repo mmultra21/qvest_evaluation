@@ -16,6 +16,7 @@ load_dotenv()  # load .env from project root early
 
 # --- FastAPI base app (API + Gradio mounted) ---
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 import gradio as gr
@@ -86,6 +87,20 @@ except Exception:
 # ---------- FastAPI app ----------
 app = FastAPI(title="Agentic RAG MVP API")
 app.include_router(llm_routes.router)
+
+
+# Serve a minimal web manifest to avoid 404s from browsers requesting /manifest.json
+@app.get("/manifest.json")
+def manifest():
+    return JSONResponse({
+        "name": "Agentic RAG MVP",
+        "short_name": "RAG MVP",
+        "start_url": "/",
+        "display": "standalone",
+        "background_color": "#ffffff",
+        "theme_color": "#ffffff",
+        "icons": []
+    })
 
 # ---------- In-memory demo data ----------
 CAMPAIGN: Dict[str, Any] = {
@@ -208,6 +223,77 @@ def _find_request_by_id(req_id: str) -> dict | None:
         if r["id"] == req_id:
             return r
     return None
+
+
+# --- Helpers: list & mark approved requests for a specific student ---
+def _approved_request_choices_for_student(grade: int, name: str):
+    """Return [(label, value=req_id), ...] of this student's *approved* requests."""
+    name = (name or "").strip()
+    items = []
+    for r in BOOK_REQUESTS:
+        if r["status"] == "approved" and int(r["grade"]) == int(grade) and r["student"] == name:
+            title = r.get("title") or "(untitled)"
+            avail = r.get("availability_date") or "—"
+            label = f"{title} — available {avail}  •  (req {r['id']})"
+            items.append((label, r["id"]))
+    items.sort(key=lambda x: x[0].lower())
+    return items
+
+
+def _mark_request_returned(grade: int, name: str, req_id: str):
+    """Mark approved request as returned, log reading, and refresh student-side views only.
+
+    Returns only the student-facing outputs:
+      - status message (Markdown string)
+      - updated approved-request dropdown (gr.update)
+      - student requests table rows
+      - winner text (s_winner)
+      - leaderboard rows (s_leader)
+    """
+    name = (name or "").strip()
+    if not name:
+        return (
+            "⚠️ Please enter your name.",
+            gr.update(choices=_approved_request_choices_for_student(int(grade), name), value=None),
+            _student_requests_table(grade, name),
+            *_student_overview(int(grade))
+        )
+
+    r = _find_request_by_id(req_id)
+    if not r or r["status"] != "approved":
+        return (
+            "⚠️ Selected request isn’t approved or no longer exists.",
+            gr.update(choices=_approved_request_choices_for_student(int(grade), name), value=None),
+            _student_requests_table(grade, name),
+            *_student_overview(int(grade))
+        )
+
+    # mark returned + count toward stats
+    r["status"] = "returned"
+    r["returned_ts"] = int(time.time())
+    record_reading(grade=int(grade), student_name=name, catalog_id=r.get("book_id") or "")
+
+    status = f"📚 Returned: *{r.get('title') or '(untitled)'}*. Great job, {name}! It now counts toward the prize."
+    return (
+        status,
+        gr.update(choices=_approved_request_choices_for_student(int(grade), name), value=None),
+        _student_requests_table(grade, name),
+        *_student_overview(int(grade))
+    )
+
+
+def _refresh_leaderboards_and_requests_tables(grade: int):
+    """Utility to refresh student winner/leader and librarian requests tables."""
+    win_text, rows = _student_overview(int(grade))
+    # Rebuild librarian table to reflect returned status
+    br_rows = _librarian_requests_table(only_pending=False)
+    # Keep the select list & detail reset
+    labels = [f"{r['id']} — {r['student']} — {r['title']}" for r in BOOK_REQUESTS]
+    ids = [r["id"] for r in BOOK_REQUESTS]
+    br_select = gr.update(choices=labels, value=[])
+    br_detail = gr.update(choices=ids, value=(ids[0] if ids else None))
+    br_msg = "_Select a single request to preview its details here._"
+    return (win_text, rows, br_rows, br_select, br_detail, br_msg)
 
 
 def _to_date(v):
@@ -1174,85 +1260,6 @@ with gr.Blocks(title="Agentic RAG MVP — Student & Librarian") as demo:
         gr.Markdown("#### Librarian Recommended Books")
         s_recs = gr.Markdown()
 
-        # ---- Log a finished book (now above 'Learn more') ----
-        gr.Markdown("#### Log a finished book (counts toward weekly prize)")
-
-        with gr.Row():
-            s_name = gr.Textbox(label="Your Name", placeholder="First name & last initial (e.g., Sam T.)")
-            s_book_log = gr.Dropdown(choices=BOOK_CHOICES(), value=FIRST_BOOK_ID_DEFAULT(), label="Book")
-        with gr.Row():
-            s_quiz = gr.Textbox(label="Mini-quiz (2–3 sentences about the book)", placeholder="Tell us something about the plot or a character you liked.", lines=3)
-            log_btn = gr.Button("Submit for approval")
-
-        # Log Status immediately beneath the log row (includes user, title, Lexile)
-        s_log_msg = gr.Markdown()
-
-        # Top 5 Readers (beneath winner & logging)
-        s_leader = gr.Dataframe(
-            headers=["Student", "Count", "Books"],
-            row_count=5,
-            interactive=False,
-            label="Top 5 Readers (your grade)"
-        )
-
-        # Helper to refresh winner + leaderboard together
-        def _student_overview(grade: int):
-            win_text = winner_text_for_grade(grade)
-            top5 = top_readers_by_grade(grade, 5)
-            rows = []
-            for name, count, books in top5:
-                titles = [BOOK_DB.get(bid, {}).get("title", bid) for bid in books]
-                rows.append([name, count, ", ".join(titles)])
-            if not rows:
-                rows = [["(no data)", 0, ""]]
-            return win_text, rows
-
-        def _student_recommended(grade: int):
-            return render_recommended_for_grade(int(grade))
-
-        refresh_btn.click(lambda g: (_student_overview(g)[0], _student_overview(g)[1], _student_recommended(g)),
-                inputs=[s_grade], outputs=[s_winner, s_leader, s_recs])
-        s_grade.release(lambda g: (_student_overview(g)[0], _student_overview(g)[1], _student_recommended(g)),
-                inputs=[s_grade], outputs=[s_winner, s_leader, s_recs])
-
-        # New: mini-quiz evaluation and submit-for-approval flow (creates pending log only)
-        def _evaluate_quiz_answer(answer: str) -> bool:
-            # Extremely simple heuristic: length >= ~40 chars (~2–3 short sentences)
-            txt = (answer or "").strip()
-            return len(txt) >= 40
-
-        def _log_submit_for_approval(grade: int, student_name: str, book_id: str, quiz_answer: str):
-            who = (student_name or "").strip()
-            if not who:
-                return "⚠️ Please enter your name.", "", []
-
-            if book_id not in BOOK_DB:
-                return f"⚠️ Unknown book id: {book_id}", "", []
-
-            info = BOOK_DB.get(book_id, {})
-            title = info.get("title", book_id)
-            lex = info.get("lexile", "—")
-
-            passed = _evaluate_quiz_answer(quiz_answer)
-            add_pending_log(grade, who, book_id, quiz_passed=passed, quiz_answer=quiz_answer)
-
-            status_note = "passed mini-quiz" if passed else "needs librarian to review mini-quiz"
-            status = (
-                f"✅ **{who}** submitted *{title}* (Lexile **{lex}**). "
-                "Your entry is now in the approval queue and will appear on the board once approved."
-            )
-
-            # DO NOT update leaderboard here (only approved count).
-            win_text, rows = _student_overview(grade)
-            return status, win_text, rows
-
-        log_btn.click(
-            _log_submit_for_approval,
-            inputs=[s_grade, s_name, s_book_log, s_quiz],
-            outputs=[s_log_msg, s_winner, s_leader]
-        )
-
-        # ---- Learn more about a book (safe chat) — moved below logging ----
         # ---- Book Request accordion (student-facing) ----
         with gr.Accordion("Book Request", open=False):
             gr.Markdown(
@@ -1286,7 +1293,7 @@ with gr.Blocks(title="Agentic RAG MVP — Student & Librarian") as demo:
                 label="My Requests"
             )
 
-        # Wire student-side behavior
+        # Wire student-side behavior for requests
         r_book.change(_prefill_request_fields, inputs=[r_book], outputs=[r_lexi, r_cat])
 
         def _submit_book_request(grade, name, book_id, lexile, category, date_needed, special):
@@ -1334,6 +1341,58 @@ with gr.Blocks(title="Agentic RAG MVP — Student & Librarian") as demo:
         )
         r_name.change(lambda g, n: _student_requests_table(g, n), inputs=[r_grade, r_name], outputs=[r_mine])
         r_grade.release(lambda g, n: _student_requests_table(g, n), inputs=[r_grade, r_name], outputs=[r_mine])
+
+        # ---- Log a finished book (from your approved requests) ----
+        gr.Markdown("#### Log a finished book (from your approved requests)")
+
+        with gr.Row():
+            s_name = gr.Textbox(label="Your Name", placeholder="First name & last initial (e.g., Sam T.)")
+            # s_grade already exists above
+
+        # New: pick from only *approved* requests for this student
+        with gr.Row():
+            s_req_pick = gr.Dropdown(
+                label="Select an approved request to mark returned",
+                choices=[],
+                allow_custom_value=False,
+                scale=5,
+            )
+            s_req_refresh = gr.Button("Refresh", scale=1)
+        log_btn = gr.Button("Mark Returned")
+
+        s_log_msg = gr.Markdown(label="Log Status")  # moved/kept as Markdown for rich feedback
+        s_leader = gr.Dataframe(headers=["Student", "Count", "Books"], row_count=5, interactive=False, label="Top 5 Readers (your grade)")
+
+        # Helper to refresh winner + leaderboard together (reintroduced)
+        def _student_overview(grade: int):
+            win_text = winner_text_for_grade(grade)
+            top5 = top_readers_by_grade(grade, 5)
+            rows = []
+            for name, count, books in top5:
+                titles = [BOOK_DB.get(bid, {}).get("title", bid) for bid in books]
+                rows.append([name, count, ", ".join(titles)])
+            if not rows:
+                rows = [["(no data)", 0, ""]]
+            return win_text, rows
+
+        def _student_recommended(grade: int):
+            return render_recommended_for_grade(int(grade))
+
+        # Populate the approved-request dropdown whenever name or grade changes
+        def _refresh_approved_dropdown(g, n):
+            return gr.update(choices=_approved_request_choices_for_student(int(g), n), value=None)
+
+        s_name.change(_refresh_approved_dropdown, inputs=[s_grade, s_name], outputs=[s_req_pick])
+        s_grade.release(_refresh_approved_dropdown, inputs=[s_grade, s_name], outputs=[s_req_pick])
+        s_req_refresh.click(_refresh_approved_dropdown, inputs=[s_grade, s_name], outputs=[s_req_pick])
+
+        # Wire 'Mark Returned' button now that r_mine (student table) exists
+        # Only student-side outputs are returned by _mark_request_returned
+        log_btn.click(
+            _mark_request_returned,
+            inputs=[s_grade, s_name, s_req_pick],
+            outputs=[s_log_msg, s_req_pick, r_mine, s_winner, s_leader]
+        )
 
         # ---- Learn more about a book (safe chat) — moved below logging ----
         gr.Markdown("#### Learn more about a book")
@@ -1719,7 +1778,8 @@ with gr.Blocks(title="Agentic RAG MVP — Student & Librarian") as demo:
                         "_Select a single request to preview its details here._"
                     )
 
-                br_refresh.click(_br_list, inputs=[br_show_all], outputs=[br_table, br_select, br_detail, br_msg])
+                # Show returned items by default on explicit refresh
+                br_refresh.click(lambda _: _br_list(True), inputs=[br_show_all], outputs=[br_table, br_select, br_detail, br_msg])
                 br_show_all.change(_br_list, inputs=[br_show_all], outputs=[br_table, br_select, br_detail, br_msg])
 
                 def _br_detail_render(req_id: str | None):
@@ -1842,6 +1902,13 @@ with gr.Blocks(title="Agentic RAG MVP — Student & Librarian") as demo:
 
 # Mount Gradio into FastAPI so UI and API live together
 from gradio.routes import mount_gradio_app
+# Populate approved-request dropdown on page load (optional)
+try:
+    demo.load(_refresh_approved_dropdown, inputs=[s_grade, s_name], outputs=[s_req_pick])
+except Exception:
+    # silent if widgets not available at import time
+    pass
+
 app = mount_gradio_app(app, demo, path="/")
 
 if __name__ == "__main__":
