@@ -112,10 +112,15 @@ READ_EVENTS: list[ReadEvent] = []  # append when a book is approved
 
 import time
 import uuid
+from datetime import datetime
 
 # Pending approvals store (each item awaits quiz + librarian approval)
 # PENDING_LOGS[grade] = [ {id, ts, student, book_id, quiz_passed, status}, ... ]
 PENDING_LOGS: Dict[int, List[Dict[str, Any]]] = {}
+
+# --- Book Requests (student-initiated) ---
+# Each item: {id, ts, grade, student, book_id, title, lexile, category, date_needed, special, status, availability_date}
+BOOK_REQUESTS: list[dict] = []
 
 def _stable_book_id(title: str, author: str) -> str:
     """Stable ID from title+author to avoid reordering collisions."""
@@ -125,6 +130,84 @@ def _stable_book_id(title: str, author: str) -> str:
 
 def _norm(s: str) -> str:
     return (unicodedata.normalize("NFKC", s or "").strip())
+
+
+def _validate_iso_date_or_none(s: str | None) -> str | None:
+    s = (s or "").strip()
+    if not s:
+        return None
+    try:
+        datetime.strptime(s, "%Y-%m-%d")
+        return s
+    except Exception:
+        raise gr.Error(f"Invalid date: {s!r}. Use YYYY-MM-DD.")
+
+
+def _book_label_choices():
+    # (label, value) for dropdown
+    items = []
+    for bid, info in BOOK_DB.items():
+        t = info.get("title", bid)
+        a = info.get("author", "Unknown")
+        lex = info.get("lexile", "—")
+        items.append((f"{t} — {a} (Lexile {lex})", bid))
+    items.sort(key=lambda x: x[0].lower())
+    return items
+
+
+def _prefill_request_fields(book_id: str):
+    info = BOOK_DB.get(book_id, {})
+    return info.get("lexile", None), info.get("category", None)
+
+
+def _student_requests_table(grade: int, name: str):
+    name = (name or "").strip()
+    rows = []
+    for r in BOOK_REQUESTS:
+        if int(r["grade"]) == int(grade) and (not name or r["student"] == name):
+            ts = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(r["ts"]))
+            rows.append([
+                ts,
+                r["title"],
+                r["lexile"] if r["lexile"] is not None else "—",
+                r["category"] or "—",
+                r["date_needed"] or "—",
+                r["status"],
+                r.get("availability_date") or "—",
+            ])
+    if not rows:
+        rows = [["(no requests yet)", "", "", "", "", "", ""]]
+    return rows
+
+
+def _librarian_requests_table(only_pending: bool = True):
+    rows = []
+    for r in BOOK_REQUESTS:
+        if only_pending and r["status"] != "pending":
+            continue
+        ts = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(r["ts"]))
+        rows.append([
+            r["id"],
+            ts,
+            r["grade"],
+            r["student"],
+            r["title"],
+            r["lexile"] if r["lexile"] is not None else "—",
+            r["category"] or "—",
+            r["date_needed"] or "—",
+            r["status"],
+            r.get("availability_date") or "—",
+        ])
+    if not rows:
+        rows = [["(none)", "", "", "", "", "", "", "", "", ""]]
+    return rows
+
+
+def _find_request_by_id(req_id: str) -> dict | None:
+    for r in BOOK_REQUESTS:
+        if r["id"] == req_id:
+            return r
+    return None
 
 
 def _to_date(v):
@@ -1170,6 +1253,89 @@ with gr.Blocks(title="Agentic RAG MVP — Student & Librarian") as demo:
         )
 
         # ---- Learn more about a book (safe chat) — moved below logging ----
+        # ---- Book Request accordion (student-facing) ----
+        with gr.Accordion("Book Request", open=False):
+            gr.Markdown(
+                "**Ask your librarian to get a book for you.**\n"
+                "- Pick a book (Lexile & category auto-fill), choose a date you need it by, and add any special request.\n"
+                "- Your request will show as **pending** until the librarian approves or rejects it.\n"
+                "- If approved, you’ll see a date when the book will be available."
+            )
+            with gr.Row():
+                r_name = gr.Textbox(label="Your Name", placeholder="First name & last initial (e.g., Sam T.)")
+                r_grade = s_grade  # reuse the main grade slider
+            with gr.Row():
+                r_book = gr.Dropdown(choices=_book_label_choices(), label="Book", allow_custom_value=False)
+                r_lexi = gr.Number(label="Lexile", precision=0)
+                r_cat  = gr.Dropdown(
+                    choices=sorted({b.get("category", "other") for b in BOOK_DB.values()} | set(CAMPAIGN.get("categories", []))),
+                    label="Category"
+                )
+            with gr.Row():
+                r_date = gr.Textbox(label="Date Needed By (YYYY-MM-DD)", placeholder="YYYY-MM-DD")
+                r_special = gr.Textbox(label="Special Request", placeholder="Format, edition, accessibility, etc.", lines=2)
+
+            with gr.Row():
+                r_submit = gr.Button("Submit Request")
+                r_clear  = gr.Button("Clear Form")
+
+            r_status = gr.Markdown()
+            r_mine   = gr.Dataframe(
+                headers=["Submitted (UTC)","Title","Lexile","Category","Needed By","Status","Available Date"],
+                interactive=False,
+                label="My Requests"
+            )
+
+        # Wire student-side behavior
+        r_book.change(_prefill_request_fields, inputs=[r_book], outputs=[r_lexi, r_cat])
+
+        def _submit_book_request(grade, name, book_id, lexile, category, date_needed, special):
+            name = (name or "").strip()
+            if not name:
+                return "⚠️ Please enter your name.", _student_requests_table(grade, name)
+            # accept chosen book or blank
+            info = BOOK_DB.get(book_id or "", {})
+            title = info.get("title", "(unspecified)") if book_id else "(unspecified)"
+            lex = int(lexile) if isinstance(lexile, (int, float)) else (info.get("lexile", None) if info else None)
+            cat = (category or info.get("category") or "other")
+            need = _validate_iso_date_or_none(date_needed)
+
+            BOOK_REQUESTS.append({
+                "id": f"req_{uuid.uuid4().hex[:8]}",
+                "ts": int(time.time()),
+                "grade": int(grade),
+                "student": name,
+                "book_id": book_id or "",
+                "title": title,
+                "lexile": lex,
+                "category": cat,
+                "date_needed": need,         # student’s requested date
+                "special": (special or "").strip(),
+                "status": "pending",         # <-- new
+                "availability_date": None,   # <-- set by librarian on approval
+            })
+
+            status = f"✅ Request submitted by **{name}** for *{title}* (Lexile **{lex if lex is not None else '—'}**, `{cat}`), needed by **{need or '—'}** — **pending**."
+            return status, _student_requests_table(grade, name)
+
+        def _clear_request_form():
+            return (gr.update(value=""), gr.update(value=None), gr.update(value=None),
+                    gr.update(value=None), gr.update(value=""), gr.update(value=""))
+
+        r_submit.click(
+            _submit_book_request,
+            inputs=[r_grade, r_name, r_book, r_lexi, r_cat, r_date, r_special],
+            outputs=[r_status, r_mine]
+        )
+        r_clear.click(
+            _clear_request_form,
+            inputs=[],
+            outputs=[r_name, r_book, r_lexi, r_cat, r_date, r_special]
+        )
+        r_name.change(lambda g, n: _student_requests_table(g, n), inputs=[r_grade, r_name], outputs=[r_mine])
+        r_grade.release(lambda g, n: _student_requests_table(g, n), inputs=[r_grade, r_name], outputs=[r_mine])
+
+        # ---- Learn more about a book (safe chat) — moved below logging ----
         gr.Markdown("#### Learn more about a book")
         with gr.Row():
             s_book = gr.Dropdown(choices=BOOK_CHOICES(), value=FIRST_BOOK_ID_DEFAULT(), label="Book")
@@ -1507,6 +1673,136 @@ with gr.Blocks(title="Agentic RAG MVP — Student & Librarian") as demo:
 
                 a_approve.click(_approve_selected, inputs=[a_grade, a_select], outputs=[a_status, a_table, a_select, a_detail, a_quiz_md, s_winner, s_leader, s_log_msg])
                 a_reject.click(_reject_selected, inputs=[a_grade, a_select], outputs=[a_status, a_table, a_select, a_detail, a_quiz_md, s_winner, s_leader, s_log_msg])
+
+            # ---- Book Requests Queue (Librarian) ----
+            with gr.Accordion("Book Requests Queue", open=False):
+                br_show_all = gr.Checkbox(label="Show all (not just pending)", value=False)
+                br_refresh  = gr.Button("Refresh")
+
+                br_table = gr.Dataframe(
+                    headers=[
+                        "ID","Submitted (UTC)","Grade","Student","Title","Lexile","Category",
+                        "Needed By","Status","Available Date"
+                    ],
+                    interactive=False,
+                    label="Requests"
+                )
+                br_select = gr.CheckboxGroup(label="Select requests")
+
+                # Detail + action
+                br_detail = gr.Dropdown(label="View details for one item", choices=[], value=None)
+                br_avail  = gr.Textbox(label="Availability Date to Student (YYYY-MM-DD)", placeholder="YYYY-MM-DD")
+                br_msg    = gr.Markdown()
+
+                with gr.Row():
+                    br_approve = gr.Button("Approve selected")
+                    br_reject  = gr.Button("Reject selected (no availability date)")
+
+                # Populate table & selectors
+                def _br_list(show_all: bool):
+                    rows = _librarian_requests_table(only_pending=not show_all)
+                    # build selector labels like "req_1234 — Student — Title"
+                    labels = []
+                    ids = []
+                    for r in BOOK_REQUESTS:
+                        if not show_all and r["status"] != "pending":
+                            continue
+                        labels.append(f"{r['id']} — {r['student']} — {r['title']}")
+                        ids.append(r["id"])
+                    detail_ids = ids[:]
+                    if not rows:
+                        rows = [["(none)", "", "", "", "", "", "", "", "", ""]]
+                    return (
+                        rows,
+                        gr.update(choices=labels, value=[]),
+                        gr.update(choices=detail_ids, value=(detail_ids[0] if detail_ids else None)),
+                        "_Select a single request to preview its details here._"
+                    )
+
+                br_refresh.click(_br_list, inputs=[br_show_all], outputs=[br_table, br_select, br_detail, br_msg])
+                br_show_all.change(_br_list, inputs=[br_show_all], outputs=[br_table, br_select, br_detail, br_msg])
+
+                def _br_detail_render(req_id: str | None):
+                    if not req_id:
+                        return "_No item selected._"
+                    r = _find_request_by_id(req_id)
+                    if not r:
+                        return "_Not found._"
+                    return (
+                        f"**{r['id']}**\n\n"
+                        f"- **Student:** {r['student']} (Grade {r['grade']})\n"
+                        f"- **Title:** *{r['title']}*  •  Lexile **{r['lexile'] if r['lexile'] is not None else '—'}**  •  `{r['category'] or '—'}`\n"
+                        f"- **Needed by:** {r['date_needed'] or '—'}\n"
+                        f"- **Status:** {r['status']}  •  **Available date:** {r.get('availability_date') or '—'}\n"
+                        f"- **Special request:** {r.get('special') or '(none)'}"
+                    )
+
+                br_detail.change(_br_detail_render, inputs=[br_detail], outputs=[br_msg])
+
+                # Approve/Reject helpers
+                def _ids_from_labels(labels: list[str]) -> list[str]:
+                    out = []
+                    for lab in (labels or []):
+                        rid = lab.split(" — ", 1)[0]
+                        if rid.startswith("req_"):
+                            out.append(rid)
+                    return out
+
+                def _approve_requests(labels: list[str], availability_iso: str, s_grade_val, s_name_val):
+                    ids = _ids_from_labels(labels)
+                    if not ids:
+                        rows, sel, det, msg = _br_list(False)
+                        # also refresh student "My Requests"
+                        return ("⚠️ No items selected.",
+                                rows, sel, det, msg,
+                                _student_requests_table(int(s_grade_val), s_name_val))
+                    avail = _validate_iso_date_or_none(availability_iso)
+                    if not avail:
+                        raise gr.Error("Please enter Availability Date (YYYY-MM-DD) to approve.")
+
+                    count = 0
+                    for rid in ids:
+                        r = _find_request_by_id(rid)
+                        if r and r["status"] == "pending":
+                            r["status"] = "approved"
+                            r["availability_date"] = avail
+                            count += 1
+
+                    rows, sel, det, msg = _br_list(False)
+                    return (f"✅ Approved {count} request(s); availability date set to **{avail}**.",
+                            rows, sel, det, msg,
+                            _student_requests_table(int(s_grade_val), s_name_val))
+
+                def _reject_requests(labels: list[str], s_grade_val, s_name_val):
+                    ids = _ids_from_labels(labels)
+                    if not ids:
+                        rows, sel, det, msg = _br_list(False)
+                        return ("⚠️ No items selected.",
+                                rows, sel, det, msg,
+                                _student_requests_table(int(s_grade_val), s_name_val))
+                    count = 0
+                    for rid in ids:
+                        r = _find_request_by_id(rid)
+                        if r and r["status"] == "pending":
+                            r["status"] = "rejected"
+                            r["availability_date"] = None
+                            count += 1
+                    rows, sel, det, msg = _br_list(False)
+                    return (f"🗑️ Rejected {count} request(s).",
+                            rows, sel, det, msg,
+                            _student_requests_table(int(s_grade_val), s_name_val))
+
+                # Wire actions — note we also refresh the student's "My Requests" (r_mine)
+                br_approve.click(
+                    _approve_requests,
+                    inputs=[br_select, br_avail, s_grade, r_name],
+                    outputs=[br_msg, br_table, br_select, br_detail, br_msg, r_mine]
+                )
+                br_reject.click(
+                    _reject_requests,
+                    inputs=[br_select, s_grade, r_name],
+                    outputs=[br_msg, br_table, br_select, br_detail, br_msg, r_mine]
+                )
 
         with gr.Accordion("Research Assistant (Prompt)", open=False):
             with gr.Row():
