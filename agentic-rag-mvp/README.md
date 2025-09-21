@@ -15,83 +15,95 @@ pip install fastapi uvicorn gradio pydantic
 2. Run the API and app in separate terminals:
 
 ```bash
-python -m api.main
-python -m app.main
-```
+# agentic-rag-mvp
 
-Notes
-- This is a scaffold: replace placeholder functions with real implementations. Add `pyproject.toml` or `requirements.txt` if you want reproducible installs.
+Lightweight RAG MVP combining a Gradio UI and FastAPI wiring. This prototype provides a Student-facing logging flow and a Librarian console for approvals, campaigns, and metrics.
 
-Testing the Hermes-3 model server
---------------------------------
+Table of contents
+- Overview
+- Recent changes (high level)
+- Quick start
+- Student workflow
+- Librarian workflow
+- Metrics & exports
+- Developer notes
 
-If you build and run `llama-server` (llama.cpp) as in `scripts/run_hermes3.sh`, the server will listen on the configured port (default 11434). Use these exact curl commands to verify the server and get a sample completion.
+## Overview
 
-1) Health check
+This project is an in-memory demo used to prototype reading campaigns and a small approval workflow. It is intentionally simple so you can iterate quickly. Core in-memory stores:
 
-```bash
-curl http://127.0.0.1:11434/health
-# expected response: {"status":"ok"}
-```
+- `BOOK_DB` — deterministic book catalog loaded from JSON/demo data
+- `PENDING_LOGS` — student submissions waiting for librarian review
+- `READ_LOGS` — approved readings grouped by grade/student
+- `READ_EVENTS` — lightweight event log (timestamped) used for time-based metrics
 
-2) Simple completion (JSON request)
+## Recent changes
 
-```bash
-curl http://127.0.0.1:11434/completion \
-	-H "Content-Type: application/json" \
-	-d '{"prompt":"Hello Hermes3!","n_predict":64,"temperature":0.2}'
-```
+- Student "Submit for approval" flow: mini-quiz and quiz pass/save logic; submissions go into `PENDING_LOGS`.
+- Campaign Setup: title, prize rules, categories, start/end dates (YYYY-MM-DD), and featured seed books. Dates validated on apply.
+- `READ_EVENTS`: appended when a librarian approves a submission; used to compute quarterly/yearly metrics.
+- Metrics helpers added (pandas + matplotlib) and a Librarian "Metrics & Exports" accordion to compute charts and export JSON/CSV.
 
-Example response (trimmed):
+## Quick start
 
-```json
-{
-	"index": 0,
-	"content": " Welcome to the forums!\nI'm Hermes3, a new member to this forum...",
-	"id_slot": 0,
-	"model": "gpt-3.5-turbo",
-	"tokens_predicted": 55,
-	"generation_settings": {
-		"n_predict": 64,
-		"temperature": 0.2
-	}
-}
-```
-
-Notes
-- If the server binary is not in `$HOME/src/llama.cpp/server`, point `LLAMA_DIR` to the folder containing `server` before running `scripts/run_hermes3.sh`.
-- On Apple Silicon you can build with Metal support; the server will show Metal device initialization in logs when using Metal.
-
-
-Client usage
-------------
-
-The repository contains a minimal stdlib Python client at `agentic-rag-mvp/scripts/clients/complete.py`.
-
-Basic usage (from repo root):
+1. Create a virtualenv and install dependencies:
 
 ```bash
-source .venv/bin/activate    # recommended
-python3 ./agentic-rag-mvp/scripts/clients/complete.py --prompt 'Hello Hermes3!'
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
-Specify host/port or full URL:
+If you don't have `requirements.txt`, at minimum:
 
 ```bash
-python3 ./agentic-rag-mvp/scripts/clients/complete.py --host 127.0.0.1 --port 11434 --prompt 'Hi'
-python3 ./agentic-rag-mvp/scripts/clients/complete.py --url 'http://127.0.0.1:11434/completion' --prompt 'Hi'
+pip install gradio fastapi uvicorn pandas matplotlib python-dotenv
 ```
 
-Advanced flags:
-- `--timeout` seconds (default 10.0)
-- `--retries` number of attempts on network error (default 1)
-- `--raw` print raw JSON output
-- `--verbose` print extra metadata
-
-If you want to run the tests or CI locally, install the test dependency and run pytest:
+2. Run the app (Gradio UI mounted on FastAPI):
 
 ```bash
-python3 -m pip install -r requirements.txt
-python3 -m pytest -q
+python -m app.gradio_main
 ```
+
+3. Open the printed local URL in your browser (Gradio UI).
+
+## Student workflow
+
+- Student tab: choose grade, enter your name, pick a book and answer the mini-quiz, then click "Submit for approval".
+- Submissions appear in "My submissions" and are placed into `PENDING_LOGS`.
+
+## Librarian workflow
+
+- Approvals Queue: review pending submissions, preview the student quiz answer, approve or reject. Approve calls `record_reading(...)` which updates `READ_LOGS`, `BOOK_PREFS`, and appends a `READ_EVENTS` entry (ts, grade, student, book_id).
+- Campaign Setup: edit the campaign card and featured seeds. Start/end date fields expect `YYYY-MM-DD` strings and are validated.
+- Leaderboards & Winners: refresh per-grade leaderboards, pick weekly winners, and view recent winners.
+
+## Metrics & Exports
+
+- The Librarian tab includes a "Metrics & Exports" accordion (below Leaderboards). Click "Compute / Refresh Metrics" to render:
+  - Books per quarter (overall)
+  - Books per quarter by grade (stacked)
+  - A table (quarter, grade, books_read)
+- Export JSON or CSV using the Export buttons; the app writes temporary files and returns them via Gradio File components.
+
+## Developer notes
+
+- Data is in-memory. For persistence, add a simple SQLite layer or save to files.
+- The campaign date fields use simple textbox inputs to support a broader range of Gradio versions; `_ui_librarian_set_campaign` validates `YYYY-MM-DD`.
+- Metrics use `pandas` and `matplotlib`. If these are not needed, remove the imports to keep dependencies light.
+
+## Testing the flow
+
+1. As a Student, submit an entry and answer the mini-quiz.
+2. In Librarian → Approvals Queue, approve the submission.
+3. Compute metrics and observe the new event appearing in quarterly summaries.
+
+## Next steps
+
+- Persist events and logs to disk or SQLite.
+- Add unit tests for the submit→approve→metrics pipeline.
+- Improve the Approvals UI (bulk actions, search, filters).
+
+If you'd like, I can also add a small script to seed test data and exercise the pipeline automatically.
 

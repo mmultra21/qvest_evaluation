@@ -4,8 +4,12 @@ from __future__ import annotations
 import os
 import io
 import json
+import datetime
 import re
-from typing import List, Dict, Any, Optional, Tuple
+import glob
+import hashlib
+import unicodedata
+from typing import List, Dict, Any, Optional, Tuple, TypedDict
 
 from dotenv import load_dotenv
 load_dotenv()  # load .env from project root early
@@ -97,14 +101,220 @@ READ_LOGS: Dict[int, Dict[str, Dict[str, Any]]] = {}       # per-grade reading l
 LAST_WEEK_WINNERS: Dict[int, Dict[str, Any]] = {}          # per-grade winners
 BOOK_PREFS: Dict[int, Dict[str, int]] = {}                 # per-grade category counts
 
-BOOK_DB: Dict[str, Dict[str, Any]] = {
-    "bk1": {"title": "Trail Adventures", "author": "K. Jay", "category": "adventure", "lexile": 750},
-    "bk2": {"title": "Oceans Explained", "author": "R. Lee", "category": "science", "lexile": 820},
-    "bk3": {"title": "Legends of the Field", "author": "M. Soto", "category": "sports", "lexile": 680},
-    "bk4": {"title": "Time Detectives", "author": "N. Chen", "category": "mystery", "lexile": 700},
-    "bk5": {"title": "Wild History", "author": "A. Diaz", "category": "history", "lexile": 790},
-    "bk6": {"title": "Forest Tales", "author": "S. Wilde", "category": "fantasy", "lexile": 720},
-}
+# ---- Lightweight read events (for time-based aggregation) ----
+class ReadEvent(TypedDict):
+    ts: int
+    grade: int
+    student: str
+    book_id: str
+
+READ_EVENTS: list[ReadEvent] = []  # append when a book is approved
+
+import time
+import uuid
+
+# Pending approvals store (each item awaits quiz + librarian approval)
+# PENDING_LOGS[grade] = [ {id, ts, student, book_id, quiz_passed, status}, ... ]
+PENDING_LOGS: Dict[int, List[Dict[str, Any]]] = {}
+
+def _stable_book_id(title: str, author: str) -> str:
+    """Stable ID from title+author to avoid reordering collisions."""
+    base = f"{title}|{author}".encode("utf-8")
+    return "bk" + hashlib.sha1(base).hexdigest()[:8]
+
+
+def _norm(s: str) -> str:
+    return (unicodedata.normalize("NFKC", s or "").strip())
+
+
+def _to_date(v):
+    if isinstance(v, datetime.date):
+        return v
+    if isinstance(v, str) and v:
+        try:
+            return datetime.date.fromisoformat(v)
+        except Exception:
+            return None
+    return None
+
+
+def _load_books_from_json(paths: list[str]) -> Dict[str, Dict[str, Any]]:
+    """
+    Load one or more JSON files into a BOOK_DB dict:
+    Expected item fields (flexible): title, author, category, grade_range, lexile, id
+    If id missing, one is generated from title+author.
+    """
+    out: Dict[str, Dict[str, Any]] = {}
+    for p in paths:
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            continue
+        # data could be a list or an object with "books"
+        items = data if isinstance(data, list) else data.get("books", [])
+        for it in items:
+            title = _norm(it.get("title", ""))
+            author = _norm(it.get("author", ""))
+            if not title:
+                continue
+            bid = _norm(it.get("id", "")) or _stable_book_id(title, author)
+            out[bid] = {
+                "title": title,
+                "author": author or "Unknown",
+                "category": _norm(it.get("category", "other")),
+                "grade_range": it.get("grade_range"),
+                "lexile": it.get("lexile") or it.get("lexile_level") or None,
+            }
+    return out
+
+
+def _default_demo_books() -> Dict[str, Dict[str, Any]]:
+    return {
+        "bk1": {"title": "Trail Adventures", "author": "K. Jay", "category": "adventure", "lexile": 750},
+        "bk2": {"title": "Oceans Explained", "author": "R. Lee", "category": "science", "lexile": 820},
+        "bk3": {"title": "Legends of the Field", "author": "M. Soto", "category": "sports", "lexile": 680},
+        "bk4": {"title": "Time Detectives", "author": "N. Chen", "category": "mystery", "lexile": 700},
+        "bk5": {"title": "Wild History", "author": "A. Diaz", "category": "history", "lexile": 790},
+        "bk6": {"title": "Forest Tales", "author": "S. Wilde", "category": "fantasy", "lexile": 720},
+    }
+
+
+def _load_books_at_startup() -> Dict[str, Dict[str, Any]]:
+    """
+    Try to load from env-configured paths first:
+      - BOOKS_JSON (single file)
+      - BOOKS_GLOB (glob, e.g., data/*books*.json)
+    Fallback: data/fiction_childrens_books_curated.json, then demo.
+    """
+    paths: list[str] = []
+    env_one = os.getenv("BOOKS_JSON")
+    env_glob = os.getenv("BOOKS_GLOB")
+    if env_one:
+        paths.append(env_one)
+    if env_glob:
+        paths.extend(sorted(glob.glob(env_glob)))
+    # sensible default
+    default_path = os.path.join(os.getcwd(), "data", "fiction_childrens_books_curated.json")
+    if not paths and os.path.exists(default_path):
+        paths.append(default_path)
+
+    books = _load_books_from_json(paths) if paths else {}
+    return books or _default_demo_books()
+
+
+# --- replace the old BOOK_DB with this:
+BOOK_DB: Dict[str, Dict[str, Any]] = _load_books_at_startup()
+
+
+def book_label(bid: str, info: Dict[str, Any]) -> str:
+    """Human-readable label for dropdowns."""
+    bits = [info.get("title", "Untitled")]
+    if info.get("author"):
+        bits.append(f"— {info['author']}")
+    if info.get("category"):
+        bits.append(f"({info['category']})")
+    return " ".join(bits)
+
+
+def BOOK_CHOICES() -> List[tuple[str, str]]:
+    """[(label, value)] for Gradio Dropdown."""
+    items = []
+    for bid, info in BOOK_DB.items():
+        items.append((book_label(bid, info), bid))
+    # Keep choices stable in display order (title sort)
+    items.sort(key=lambda x: x[0].lower())
+    return items
+
+
+def FIRST_BOOK_ID_DEFAULT() -> Optional[str]:
+    try:
+        return BOOK_CHOICES()[0][1]
+    except Exception:
+        return None
+
+
+def _grade_range_str(gr):
+    if not gr:
+        return "All grades"
+    # Accept forms like "5-8", [5,8], "6", or {"min":6,"max":8}
+    try:
+        if isinstance(gr, str):
+            if "-" in gr:
+                a, b = gr.split("-", 1)
+                return f"Grades {int(a)}–{int(b)}"
+            g = int(gr)
+            return f"Grade {g}"
+        if isinstance(gr, (list, tuple)) and len(gr) == 2:
+            return f"Grades {int(gr[0])}–{int(gr[1])}"
+        if isinstance(gr, dict):
+            mn = int(gr.get("min")) if gr.get("min") is not None else None
+            mx = int(gr.get("max")) if gr.get("max") is not None else None
+            if mn and mx:
+                return f"Grades {mn}–{mx}"
+            if mn and not mx:
+                return f"Grades {mn}+"
+            if mx and not mn:
+                return f"Up to Grade {mx}"
+    except Exception:
+        pass
+    return "All grades"
+
+
+def _grade_in_range(student_grade: int, gr) -> bool:
+    if not gr:
+        return True
+    try:
+        if isinstance(gr, str):
+            if "-" in gr:
+                a, b = gr.split("-", 1)
+                return int(a) <= student_grade <= int(b)
+            return int(gr) == student_grade
+        if isinstance(gr, (list, tuple)) and len(gr) == 2:
+            return int(gr[0]) <= student_grade <= int(gr[1])
+        if isinstance(gr, dict):
+            mn = gr.get("min"); mx = gr.get("max")
+            if mn is not None and student_grade < int(mn): return False
+            if mx is not None and student_grade > int(mx): return False
+            return True
+    except Exception:
+        return True
+    return True
+
+
+def SEED_BOOK_CHOICES() -> list[tuple[str, str]]:
+    """[(label, value)] for the librarian Featured Seed Books picker."""
+    items = []
+    for bid, info in BOOK_DB.items():
+        title = info.get("title", "Untitled")
+        author = info.get("author", "Unknown")
+        lex = info.get("lexile", "—")
+        grs = _grade_range_str(info.get("grade_range"))
+        label = f"{title} — {author} (Lexile {lex}; {grs})"
+        items.append((label, bid))
+    items.sort(key=lambda x: x[0].lower())
+    return items
+
+
+def render_recommended_for_grade(grade: int) -> str:
+    """Markdown list of librarian seed picks filtered by grade_range."""
+    bids = CAMPAIGN.get("seed_list") or []
+    lines = []
+    for bid in bids:
+        info = BOOK_DB.get(bid) or {}
+        if not info:
+            continue
+        if not _grade_in_range(int(grade), info.get("grade_range")):
+            continue
+        title = info.get("title", bid)
+        author = info.get("author", "Unknown")
+        cat = info.get("category", "other")
+        lex = info.get("lexile", "—")
+        grs = _grade_range_str(info.get("grade_range"))
+        lines.append(f"- *{title}* — {author}  •  `{cat}`  •  **Lexile {lex}**  •  {grs}")
+    if not lines:
+        return "_No librarian picks for your grade yet._"
+    return "\n".join(lines)
 
 # Keep raw text for inspect/debug (filename -> text)
 RAG_CORPUS: Dict[str, str] = {}
@@ -203,7 +413,7 @@ def is_prompt_safe(text: str) -> Tuple[bool, str]:
     return True, "ok"
 
 # ---------- Leaderboard utils ----------
-def record_reading(grade: int, student_name: str, catalog_id: str):
+def record_reading(grade: int, student_name: str, catalog_id: str, *, ts: int | None = None):
     grade = int(grade)
     READ_LOGS.setdefault(grade, {})
     student = READ_LOGS[grade].setdefault(student_name, {"count": 0, "books": []})
@@ -213,6 +423,36 @@ def record_reading(grade: int, student_name: str, catalog_id: str):
     BOOK_PREFS.setdefault(grade, {})
     cat = BOOK_DB.get(catalog_id, {}).get("category", "other")
     BOOK_PREFS[grade][cat] = BOOK_PREFS[grade].get(cat, 0) + 1
+
+    # NEW: add an event (used for metrics)
+    READ_EVENTS.append({
+        "ts": ts or int(time.time()),
+        "grade": grade,
+        "student": student_name,
+        "book_id": catalog_id,
+    })
+
+
+def add_pending_log(grade: int, student: str, book_id: str, quiz_passed: bool = False, quiz_answer: str = ""):
+    grade = int(grade)
+    PENDING_LOGS.setdefault(grade, [])
+    PENDING_LOGS[grade].append({
+        "id": f"req_{uuid.uuid4().hex[:8]}",
+        "ts": int(time.time()),
+        "student": student,
+        "book_id": book_id,
+        "quiz_answer": (quiz_answer or "").strip(),
+        "quiz_passed": quiz_passed,
+        "status": "pending_approval" if quiz_passed else "pending_quiz",
+    })
+
+
+def pending_label(item: Dict[str, Any]) -> str:
+    info = BOOK_DB.get(item["book_id"], {})
+    title = info.get("title", item["book_id"])
+    lex = info.get("lexile", "—")
+    who = item.get("student", "Unknown")
+    return f'{item.get("id")} — {who} — {title} (Lexile {lex}) — {item.get("status")}'
 
 def top_readers_by_grade(grade: int, k: int = 5):
     entries = READ_LOGS.get(grade, {})
@@ -224,12 +464,259 @@ def top_categories_for_grade(grade: int, k: int = 5):
     ranked = sorted(prefs.items(), key=lambda kv: kv[1], reverse=True)
     return ranked[:k]
 
+def avg_lexile_by_category_for_grade(grade: int):
+    """Compute average Lexile per category for books actually logged by this grade."""
+    entries = READ_LOGS.get(int(grade), {})
+    # collect all book_ids read in this grade
+    book_ids = []
+    for s in entries.values():
+        book_ids.extend(s.get("books", []))
+
+    from collections import defaultdict
+    sums = defaultdict(int)
+    counts = defaultdict(int)
+
+    for bid in book_ids:
+        info = BOOK_DB.get(bid) or {}
+        cat = info.get("category", "other")
+        lx = info.get("lexile")
+        if isinstance(lx, (int, float)):
+            sums[cat] += lx
+            counts[cat] += 1
+
+    rows = []
+    for cat in sorted(set(list(sums.keys()) + list(counts.keys()))):
+        c = counts.get(cat, 0)
+        avg = round(sums[cat] / c, 1) if c else None
+        rows.append([cat, c, avg])
+    # sort by count desc, then by category
+    rows.sort(key=lambda r: (-r[1], r[0]))
+    return rows
+
+
+# ---- Metrics helpers ----
+import pandas as pd
+import matplotlib.pyplot as plt
+from io import StringIO
+import tempfile
+import json as _json
+import os as _os
+
+def _events_df() -> pd.DataFrame:
+    if not READ_EVENTS:
+        return pd.DataFrame(columns=["ts","date","year","quarter","grade","student","book_id","title"])
+    df = pd.DataFrame(READ_EVENTS)
+    df["date"] = pd.to_datetime(df["ts"], unit="s", utc=True).dt.tz_convert("UTC").dt.date
+    df["year"] = pd.to_datetime(df["ts"], unit="s", utc=True).dt.year
+    q = pd.to_datetime(df["ts"], unit="s", utc=True).dt.quarter
+    df["quarter"] = "Q" + q.astype(str)
+    # add human title for readability
+    df["title"] = df["book_id"].map(lambda bid: BOOK_DB.get(bid, {}).get("title", bid))
+    return df
+
+def _summary_quarter_overall(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame(columns=["year","quarter","books_read"])
+    s = df.groupby(["year","quarter"], as_index=False).size().rename(columns={"size":"books_read"})
+    s = s.sort_values(["year","quarter"])
+    return s
+
+def _summary_quarter_by_grade(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame(columns=["year","quarter","grade","books_read"])
+    s = df.groupby(["year","quarter","grade"], as_index=False).size().rename(columns={"size":"books_read"})
+    s = s.sort_values(["year","quarter","grade"])
+    return s
+
+def _summary_year_overall(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame(columns=["year","books_read"])
+    return df.groupby(["year"], as_index=False).size().rename(columns={"size":"books_read"}).sort_values("year")
+
+def _plot_quarter_overall(dfq: pd.DataFrame):
+    fig, ax = plt.subplots(figsize=(6,3.2))
+    if dfq.empty:
+        ax.text(0.5, 0.5, "No data yet", ha="center", va="center", fontsize=12)
+        ax.axis("off")
+        return fig
+    x_labels = dfq["year"].astype(str) + " " + dfq["quarter"]
+    ax.bar(x_labels, dfq["books_read"])
+    ax.set_title("Books Read per Quarter (Overall)")
+    ax.set_xlabel("Quarter")
+    ax.set_ylabel("Books")
+    ax.tick_params(axis="x", rotation=45)
+    fig.tight_layout()
+    return fig
+
+def _plot_quarter_by_grade(dfqg: pd.DataFrame):
+    fig, ax = plt.subplots(figsize=(6.5,3.6))
+    if dfqg.empty:
+        ax.text(0.5, 0.5, "No data yet", ha="center", va="center", fontsize=12)
+        ax.axis("off")
+        return fig
+    dfqg = dfqg.copy()
+    dfqg["label"] = dfqg["year"].astype(str) + " " + dfqg["quarter"]
+    piv = dfqg.pivot_table(index="label", columns="grade", values="books_read", fill_value=0, aggfunc="sum")
+    bottom = None
+    for grade in sorted(piv.columns):
+        vals = piv[grade].values
+        if bottom is None:
+            ax.bar(piv.index, vals, label=f"Grade {grade}")
+            bottom = vals
+        else:
+            ax.bar(piv.index, vals, bottom=bottom, label=f"Grade {grade}")
+            bottom = bottom + vals
+    ax.set_title("Books Read per Quarter by Grade (Stacked)")
+    ax.set_xlabel("Quarter")
+    ax.set_ylabel("Books")
+    ax.tick_params(axis="x", rotation=45)
+    ax.legend(ncol=4, fontsize=8)
+    fig.tight_layout()
+    return fig
+
+# Exporters (return file paths for Gradio File components)
+def _export_json(data: dict) -> str:
+    fd, path = tempfile.mkstemp(suffix=".json", prefix="metrics_")
+    _os.close(fd)
+    with open(path, "w", encoding="utf-8") as f:
+        _json.dump(data, f, ensure_ascii=False, indent=2)
+    return path
+
+def _export_csv(df: pd.DataFrame, name: str = "metrics") -> str:
+    fd, path = tempfile.mkstemp(suffix=".csv", prefix=f"{name}_")
+    _os.close(fd)
+    df.to_csv(path, index=False)
+    return path
+
+def compute_metrics():
+    df = _events_df()
+    quarter_overall = _summary_quarter_overall(df)
+    quarter_by_grade = _summary_quarter_by_grade(df)
+    year_overall = _summary_year_overall(df)
+    fig_q = _plot_quarter_overall(quarter_overall)
+    fig_qg = _plot_quarter_by_grade(quarter_by_grade)
+    table = quarter_by_grade.copy()
+    return fig_q, fig_qg, table, quarter_overall, quarter_by_grade, year_overall
+
+def export_metrics_json():
+    _, _, _, qo, qg, yo = compute_metrics()
+    blob = {
+        "generated_utc": int(time.time()),
+        "quarter_overall": qo.to_dict(orient="records"),
+        "quarter_by_grade": qg.to_dict(orient="records"),
+        "year_overall": yo.to_dict(orient="records"),
+    }
+    return _export_json(blob)
+
+def export_metrics_csv():
+    _, _, _, _, qg, _ = compute_metrics()
+    return _export_csv(qg, name="metrics_quarter_by_grade")
+
+
+def winner_text_for_grade(grade: int) -> str:
+    w = LAST_WEEK_WINNERS.get(int(grade))
+    if not w:
+        return f"No winner recorded yet for Grade {grade}."
+    name = w.get("student", "Unknown")
+    count = w.get("count", 0)
+    book_ids = w.get("books") or []
+    titles = [BOOK_DB.get(bid, {}).get("title", bid) for bid in book_ids]
+    books_str = ", ".join(titles) if titles else "no listed books"
+    return f"🏆 Last week’s winner (Grade {grade}): **{name}** — **{count}** book(s). Titles: _{books_str}_."
+
+
+def _md_list(items: list[str]) -> str:
+    if not items:
+        return "- (none)"
+    return "\n".join(f"- {x}" for x in items)
+
+
+def campaign_markdown(campaign: dict) -> str:
+    def _fmt_date_iso(s: str | None) -> str:
+        if not s:
+            return "—"
+        # s is already "YYYY-MM-DD"; show a nicer label like 'Sep 20, 2025'
+        try:
+            y, m, d = s.split("-")
+            import calendar
+            return f"{calendar.month_abbr[int(m)]} {int(d)}, {y}"
+        except Exception:
+            # fallback to trying to parse via datetime
+            try:
+                dobj = datetime.date.fromisoformat(s)
+                return dobj.strftime("%b %d, %Y")
+            except Exception:
+                return s
+
+    title = campaign.get("title") or "Untitled Campaign"
+    prize = campaign.get("prize_rules") or "—"
+    start = _fmt_date_iso(campaign.get("start_date"))
+    end = _fmt_date_iso(campaign.get("end_date"))
+    cats = campaign.get("categories") or []
+    seeds = campaign.get("seed_list") or []
+
+    # Map seed IDs to detailed labels including Lexile and grade range
+    seed_labels = []
+    for bid in seeds:
+        info = BOOK_DB.get(bid) or {}
+        if info:
+            t = info.get('title', 'Untitled')
+            a = info.get('author', 'Unknown')
+            lex = info.get('lexile', '—')
+            grs = _grade_range_str(info.get('grade_range'))
+            seed_labels.append(f"{t} — {a} (Lexile {lex}; {grs})")
+        else:
+            seed_labels.append(bid)
+
+    return (
+        f"### {title}\n\n"
+        f"**Prize rules:** {prize}\n\n"
+        f"**Dates:** {start} → {end}\n\n"
+        f"**Categories:**\n{_md_list(cats)}\n\n"
+        f"**Featured (seeds):**\n{_md_list(seed_labels)}"
+    )
+
+
+def campaign_spotlight_markdown(campaign: dict) -> str:
+    title = campaign.get("title") or "Reading Week Spotlight"
+    seeds = campaign.get("seed_list") or []
+    if not seeds:
+        return f"### {title}\n\n_No featured books selected yet._"
+
+    lines = []
+    for bid in seeds:
+        info = BOOK_DB.get(bid, {})
+        t = info.get("title", bid)
+        a = info.get("author", "Unknown")
+        cat = info.get("category", "other")
+        lex = info.get("lexile", "—")
+        grs = _grade_range_str(info.get("grade_range"))
+        lines.append(f"- *{t}* — {a}  •  `{cat}`  •  **Lexile {lex}**  •  {grs}")
+
+    return f"### {title}\n\n" + "\n".join(lines)
+
+
+def winner_markdown_for_grade(grade: int) -> str:
+    w = LAST_WEEK_WINNERS.get(int(grade))
+    if not w:
+        return f"**Winner (Grade {grade})**\n\n- No winner recorded yet."
+    name = w.get("student", "Unknown")
+    count = w.get("count", 0)
+    book_ids = w.get("books") or []
+    titles = [BOOK_DB.get(bid, {}).get("title", bid) for bid in book_ids]
+    titles_md = _md_list(titles)
+    return (
+        f"**Winner (Grade {grade})**\n\n"
+        f"- **Student:** {name}\n"
+        f"- **Books read:** {count}\n"
+        f"- **Titles:**\n{titles_md}"
+    )
+
 # ---------- Student UI callbacks ----------
 def ui_student_get_overview(grade: int):
     cats = top_categories_for_grade(grade, 5)
-    winner = LAST_WEEK_WINNERS.get(grade)
     cats_table = [[c, n] for c, n in cats] or [["(no data)", 0]]
-    winner_text = json.dumps(winner or {"message": "No winner recorded yet."}, indent=2)
+    winner_text = winner_text_for_grade(grade)
     return cats_table, winner_text
 
 def ui_student_learn_book(book_id: str, question: str):
@@ -263,8 +750,22 @@ def ui_student_log_read(grade: int, student_name: str, book_id: str):
         return f"Unknown book id: {book_id}", []
     record_reading(grade, student_name.strip(), book_id)
     top5 = top_readers_by_grade(grade, 5)
-    table = [[name, count, ", ".join(books)] for name, count, books in top5] or [["(no data)", 0, ""]]
+
+    table = []
+    for name, count, books in top5:
+        titles = [BOOK_DB.get(bid, {}).get("title", bid) for bid in books]
+        table.append([name, count, ", ".join(titles)])
+    table = table or [["(no data)", 0, ""]]
     return f"Logged '{BOOK_DB[book_id]['title']}' for {student_name}!", table
+
+
+def ui_librarian_leaderboard(grade: int):
+    top5 = top_readers_by_grade(grade, 5)
+    table = []
+    for name, count, books in top5:
+        titles = [BOOK_DB.get(bid, {}).get("title", bid) for bid in books]
+        table.append([name, count, ", ".join(titles)])
+    return table or [["(no data)", 0, ""]]
 
 # ---------- Librarian research helpers ----------
 def synthesize_from_hits(question: str, hits):
@@ -521,6 +1022,9 @@ def ui_rag_upload(filepaths: list[str] | None) -> str:
 
     return json.dumps(report, indent=2)
 
+
+# (Reload helper removed)
+
 # ---------- Admin helpers ----------
 def web_status() -> str:
     """Return JSON showing whether SERPAPI_KEY is set and if a quick ping works."""
@@ -560,88 +1064,453 @@ with gr.Blocks(title="Agentic RAG MVP — Student & Librarian") as demo:
 
     with gr.Tab("Student"):
         gr.Markdown("### Student Dashboard")
+
+        # ---- How to use (Student) AT TOP ----
+        with gr.Accordion("How to use (Student)", open=False):
+            gr.Markdown(
+                "- Set your **grade** to see the weekly winner and top readers.\n"
+                "- **Log a finished book**: submit your name, pick the book, and write 2–3 sentences for a mini-quiz.\n"
+                "  Your book will show as **pending** until the librarian approves it. Only approved books count for prizes.\n"
+                "- **Digital checkout**: if your school uses digital books, your checkout can auto-create a pending entry; "
+                "a physical checkout (with barcode scan) can also earn extra prizes.\n"
+                "- **Lexile (reading level)**: a number that estimates difficulty (lower = easier, higher = more challenging). "
+                "Aim near your level, and stretch a bit for growth.\n"
+                "- **Key terms**: *Pending* = awaiting quiz or approval; *Approved* = counts on the board; *Rejected* = did not meet requirements.\n"
+                "- **Be safe**: don’t share personal info (emails/phone numbers), usernames, or links."
+            )
+
+        # ---- Grade + Refresh ----
         with gr.Row():
             s_grade = gr.Slider(1, 12, value=5, step=1, label="Your Grade")
-            refresh_btn = gr.Button("Refresh Overview")
-        with gr.Row():
-            s_topcats = gr.Dataframe(headers=["Category", "Count"], row_count=5, interactive=False, label="Top 5 Categories in Your Grade")
-            s_winner = gr.Code(label="Last Week's Winner (your grade)", language="json")
-        refresh_btn.click(ui_student_get_overview, inputs=[s_grade], outputs=[s_topcats, s_winner])
+            refresh_btn = gr.Button("Refresh")
 
-        gr.Markdown("#### Learn more about a book (safe chat)")
+        # Winner just under grade
+        s_winner = gr.Markdown()
+
+        # Recommended books (from librarian seeds) for this grade
+        gr.Markdown("#### Librarian Recommended Books")
+        s_recs = gr.Markdown()
+
+        # ---- Log a finished book (now above 'Learn more') ----
+        gr.Markdown("#### Log a finished book (counts toward weekly prize)")
+
         with gr.Row():
-            s_book = gr.Dropdown(choices=list(BOOK_DB.keys()), value="bk2", label="Book ID")
+            s_name = gr.Textbox(label="Your Name", placeholder="First name & last initial (e.g., Sam T.)")
+            s_book_log = gr.Dropdown(choices=BOOK_CHOICES(), value=FIRST_BOOK_ID_DEFAULT(), label="Book")
+        with gr.Row():
+            s_quiz = gr.Textbox(label="Mini-quiz (2–3 sentences about the book)", placeholder="Tell us something about the plot or a character you liked.", lines=3)
+            log_btn = gr.Button("Submit for approval")
+
+        # Log Status immediately beneath the log row (includes user, title, Lexile)
+        s_log_msg = gr.Markdown()
+
+        # Top 5 Readers (beneath winner & logging)
+        s_leader = gr.Dataframe(
+            headers=["Student", "Count", "Books"],
+            row_count=5,
+            interactive=False,
+            label="Top 5 Readers (your grade)"
+        )
+
+        # Helper to refresh winner + leaderboard together
+        def _student_overview(grade: int):
+            win_text = winner_text_for_grade(grade)
+            top5 = top_readers_by_grade(grade, 5)
+            rows = []
+            for name, count, books in top5:
+                titles = [BOOK_DB.get(bid, {}).get("title", bid) for bid in books]
+                rows.append([name, count, ", ".join(titles)])
+            if not rows:
+                rows = [["(no data)", 0, ""]]
+            return win_text, rows
+
+        def _student_recommended(grade: int):
+            return render_recommended_for_grade(int(grade))
+
+        refresh_btn.click(lambda g: (_student_overview(g)[0], _student_overview(g)[1], _student_recommended(g)),
+                inputs=[s_grade], outputs=[s_winner, s_leader, s_recs])
+        s_grade.release(lambda g: (_student_overview(g)[0], _student_overview(g)[1], _student_recommended(g)),
+                inputs=[s_grade], outputs=[s_winner, s_leader, s_recs])
+
+        # New: mini-quiz evaluation and submit-for-approval flow (creates pending log only)
+        def _evaluate_quiz_answer(answer: str) -> bool:
+            # Extremely simple heuristic: length >= ~40 chars (~2–3 short sentences)
+            txt = (answer or "").strip()
+            return len(txt) >= 40
+
+        def _log_submit_for_approval(grade: int, student_name: str, book_id: str, quiz_answer: str):
+            who = (student_name or "").strip()
+            if not who:
+                return "⚠️ Please enter your name.", "", []
+
+            if book_id not in BOOK_DB:
+                return f"⚠️ Unknown book id: {book_id}", "", []
+
+            info = BOOK_DB.get(book_id, {})
+            title = info.get("title", book_id)
+            lex = info.get("lexile", "—")
+
+            passed = _evaluate_quiz_answer(quiz_answer)
+            add_pending_log(grade, who, book_id, quiz_passed=passed, quiz_answer=quiz_answer)
+
+            status_note = "passed mini-quiz" if passed else "needs librarian to review mini-quiz"
+            status = (
+                f"✅ **{who}** submitted *{title}* (Lexile **{lex}**). "
+                "Your entry is now in the approval queue and will appear on the board once approved."
+            )
+
+            # DO NOT update leaderboard here (only approved count).
+            win_text, rows = _student_overview(grade)
+            return status, win_text, rows
+
+        log_btn.click(
+            _log_submit_for_approval,
+            inputs=[s_grade, s_name, s_book_log, s_quiz],
+            outputs=[s_log_msg, s_winner, s_leader]
+        )
+
+        # ---- Learn more about a book (safe chat) — moved below logging ----
+        gr.Markdown("#### Learn more about a book")
+        with gr.Row():
+            s_book = gr.Dropdown(choices=BOOK_CHOICES(), value=FIRST_BOOK_ID_DEFAULT(), label="Book")
             s_q = gr.Textbox(label="Your question", placeholder="e.g., What is the main theme? Is this age-appropriate for grade 5?", lines=2)
-            s_ask = gr.Button("Ask")
-            s_answer = gr.Textbox(label="Answer", lines=6)
 
-            # NEW: Clear button to reset question and answer fields
-            s_clear = gr.Button("Clear")
-            s_clear.click(lambda: ("", ""), inputs=None, outputs=[s_q, s_answer])
+        s_book_info = gr.Markdown()
+        def _student_book_info(bid: str):
+            info = BOOK_DB.get(bid) or {}
+            title = info.get("title", "Untitled")
+            author = info.get("author", "Unknown")
+            cat = info.get("category", "other")
+            lx = info.get("lexile", "—")
+            return f"**Selected:** *{title}* — {author}  •  Category: `{cat}`  •  Lexile: `{lx}`"
+        s_book.change(_student_book_info, inputs=[s_book], outputs=[s_book_info])
 
-        gr.Markdown("**Safety & tips:** Keep questions specific (themes, characters, reading level). Avoid personal info, external links, or spoilers unless you ask for them.")
-        gr.Markdown("**Prohibited use:** Do not share personal contact info (emails, phone numbers), do not request or post links, avoid NSFW topics, and do not ask the model to contact you outside this app.")
+        s_ask = gr.Button("Ask")
+        s_answer = gr.Textbox(label="Answer", lines=6)
         s_ask.click(ui_student_learn_book, inputs=[s_book, s_q], outputs=[s_answer])
         s_q.submit(ui_student_learn_book, inputs=[s_book, s_q], outputs=[s_answer])
 
-        gr.Markdown("#### Log a finished book (counts toward weekly prize)")
-        with gr.Row():
-            s_name = gr.Textbox(label="Your Name", placeholder="First name & last initial (e.g., Sam T.)")
-            s_book_log = gr.Dropdown(choices=list(BOOK_DB.keys()), value="bk2", label="Book ID")
-            log_btn = gr.Button("Log Book")
-        s_log_msg = gr.Textbox(label="Log Status", interactive=False)
-        s_leader = gr.Dataframe(headers=["Student", "Count", "Books"], row_count=5, interactive=False, label="Top 5 Readers (your grade)")
-        log_btn.click(ui_student_log_read, inputs=[s_grade, s_name, s_book_log], outputs=[s_log_msg, s_leader])
+        with gr.Accordion("My submissions", open=False):
+            my_name = gr.Textbox(label="Your Name")
+            my_refresh = gr.Button("Refresh")
+            my_table = gr.Dataframe(headers=["ID","Title","Lexile","Status","Submitted (UTC)"], interactive=False)
+
+            def _my_submissions(grade: int, name: str):
+                name = (name or "").strip()
+                rows = []
+                # Pending
+                for it in PENDING_LOGS.get(int(grade), []):
+                    if it["student"] == name:
+                        info = BOOK_DB.get(it["book_id"], {})
+                        rows.append([it["id"], info.get("title", it["book_id"]), info.get("lexile","—"),
+                                     it.get("status","pending"), time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(it.get("ts",0)))])
+                # Approved (in READ_LOGS)
+                for s_name, data in READ_LOGS.get(int(grade), {}).items():
+                    if s_name == name:
+                        for bid in data.get("books", []):
+                            info = BOOK_DB.get(bid, {})
+                            rows.append(["(approved)", info.get("title", bid), info.get("lexile","—"),
+                                         "approved", "—"])
+                if not rows:
+                    rows = [["(none)","","","",""]]
+                return rows
+
+            my_refresh.click(_my_submissions, inputs=[s_grade, my_name], outputs=[my_table])
 
     with gr.Tab("Librarian"):
         gr.Markdown("### Librarian Console")
 
+        with gr.Accordion("How to use (Librarian)", open=False):
+            gr.Markdown(
+                "- **Approvals Queue**: review students’ pending submissions. You may approve (counts toward prizes) or reject.\n"
+                "- **Campaign Setup**: set title, prize rules, dates, featured books.\n"
+                "- **Leaderboards & Winners**: leaders reflect **approved** books only. Use **Pick Weekly Winner** when ready.\n"
+                "- **Reading Insights**: top categories and **average Lexile by category** (approved books only).\n"
+                "- **Lexile**: numeric reading difficulty (lower = easier, higher = advanced). Use averages to gauge appropriateness and growth.\n"
+                "- **Key terms**: *Pending* = awaiting quiz/approval; *Approved* = counted; *Rejected* = not counted.\n"
+                "- **Research Assistant**: router-aware (vector/web/LLM); enable web routing for recency; cite snippets.\n"
+                "- **Agentic RAG**: upload txt/md/csv/json/docx/pdf; chunk to Qdrant for retrieval."
+            )
+
         with gr.Accordion("Campaign Setup", open=True):
             l_title = gr.Textbox(label="Campaign Title", value=CAMPAIGN["title"])
             l_prize = gr.Textbox(label="Prize Rules", value=CAMPAIGN["prize_rules"])
+
             l_categories = gr.CheckboxGroup(
                 choices=list({*CAMPAIGN["categories"], *[b.get("category", "other") for b in BOOK_DB.values()]}),
                 value=CAMPAIGN["categories"],
                 label="Categories"
             )
+
             with gr.Row():
-                l_start = gr.Textbox(label="Start Date (YYYY-MM-DD)")
-                l_end = gr.Textbox(label="End Date (YYYY-MM-DD)")
-            l_seed = gr.CheckboxGroup(choices=list(BOOK_DB.keys()), value=CAMPAIGN["seed_list"], label="Featured Seed Books")
+                # Use plain textboxes to accept YYYY-MM-DD strings for broader compatibility
+                l_start = gr.Textbox(label="Start Date (YYYY-MM-DD)", value=CAMPAIGN.get("start_date") or "")
+                l_end = gr.Textbox(label="End Date (YYYY-MM-DD)",   value=CAMPAIGN.get("end_date") or "")
+
+            # --- Featured Seed Books accordion (stays above campaign details) ---
+            with gr.Accordion("Featured Seed Books", open=True):
+                l_seed = gr.CheckboxGroup(
+                    choices=SEED_BOOK_CHOICES(),
+                    value=CAMPAIGN.get("seed_list", []),
+                    label="Pick spotlight titles (Title — Author • Lexile • Grade Range)"
+                )
+
             apply_btn = gr.Button("Apply Campaign Settings")
-            l_campaign_json = gr.Code(label="Current Campaign JSON", language="json")
-            def _ui_librarian_set_campaign(title: str, prize_rules: str, categories: List[str], start: str, end: str, seed_list: List[str]):
+
+            # --- NEW: Campaign Details accordion (moved under Featured Seeds + Spotlight) ---
+            with gr.Accordion("Campaign Details", open=False):
+                # this now lives *below* the featured seeds accordion
+                l_campaign_md = gr.Markdown(value=campaign_markdown(CAMPAIGN))
+
+            # (Reload Books UI removed)
+            from datetime import datetime
+
+            def _validate_iso_date(s: str) -> str | None:
+                if not s:
+                    return None
+                try:
+                    # ensure format YYYY-MM-DD
+                    datetime.strptime(s, "%Y-%m-%d")
+                    return s
+                except ValueError:
+                    raise gr.Error(f"Invalid date: {s!r}. Use YYYY-MM-DD.")
+
+            def _ui_librarian_set_campaign(title, prize_rules, categories, start_date, end_date, seed_list):
+                start_iso = _validate_iso_date((start_date or "").strip())
+                end_iso = _validate_iso_date((end_date or "").strip())
+
+                if start_iso and end_iso and end_iso < start_iso:
+                    raise gr.Error(f"End Date ({end_iso}) cannot be earlier than Start Date ({start_iso}).")
+
                 CAMPAIGN.update({
                     "title": title or CAMPAIGN["title"],
                     "prize_rules": prize_rules or CAMPAIGN["prize_rules"],
                     "categories": categories or CAMPAIGN["categories"],
-                    "start_date": start or None,
-                    "end_date": end or None,
-                    "seed_list": seed_list or CAMPAIGN["seed_list"],
+                    "start_date": start_iso,
+                    "end_date": end_iso,
+                    "seed_list": seed_list or [],
                 })
-                return json.dumps(CAMPAIGN, indent=2)
-            apply_btn.click(_ui_librarian_set_campaign, inputs=[l_title, l_prize, l_categories, l_start, l_end, l_seed], outputs=[l_campaign_json])
+                return campaign_markdown(CAMPAIGN)
+
+            # When campaign is applied, refresh both the campaign card and the Spotlight panel
+            apply_btn.click(
+                _ui_librarian_set_campaign,
+                inputs=[l_title, l_prize, l_categories, l_start, l_end, l_seed],
+                outputs=[l_campaign_md],
+            )
+
+        # (Spotlight display moved into Campaign Setup above)
 
         with gr.Accordion("Leaderboards & Winners", open=True):
             l_grade = gr.Slider(1, 12, value=5, step=1, label="Grade")
             l_refresh = gr.Button("Refresh Leaderboard")
             l_table = gr.Dataframe(headers=["Student", "Count", "Books"], row_count=5, interactive=False)
-            l_refresh.click(lambda g: [[n, c, ", ".join(b)] for n, c, b in top_readers_by_grade(g, 5)] or [["(no data)", 0, ""]], inputs=[l_grade], outputs=[l_table])
+            l_refresh.click(ui_librarian_leaderboard, inputs=[l_grade], outputs=[l_table])
 
             pick_btn = gr.Button("Pick Weekly Winner (by grade)")
-            l_winner = gr.Code(label="Winner JSON", language="json")
+            l_winner = gr.Markdown()
             def _ui_librarian_pick_winner(grade: int):
                 top5 = top_readers_by_grade(grade, 1)
                 if not top5:
-                    return json.dumps({"message": "No readers yet."}, indent=2)
+                    return f"**Winner (Grade {grade})**\n\n- No readers yet."
                 name, count, books = top5[0]
                 LAST_WEEK_WINNERS[grade] = {"student": name, "count": count, "books": books}
-                return json.dumps({"winner": LAST_WEEK_WINNERS[grade]}, indent=2)
+                return winner_markdown_for_grade(grade)
             pick_btn.click(_ui_librarian_pick_winner, inputs=[l_grade], outputs=[l_winner])
+
+        with gr.Accordion("Metrics & Exports", open=False):
+            gr.Markdown(
+                "Track **approved** books over time. These charts use timestamps when librarians approve student submissions.\n"
+                "- **Quarterly overall** shows total approved books per quarter.\n"
+                "- **Quarterly by grade** stacks grade totals per quarter.\n"
+                "- Export summaries as **JSON** or **CSV**."
+            )
+            m_refresh = gr.Button("Compute / Refresh Metrics")
+
+            with gr.Row():
+                m_plot_q = gr.Plot(label="Books per Quarter (Overall)")
+                m_plot_qg = gr.Plot(label="Books per Quarter by Grade (Stacked)")
+
+            m_table = gr.Dataframe(
+                headers=["year","quarter","grade","books_read"],
+                interactive=False,
+                label="Quarterly by Grade (table)"
+            )
+
+            with gr.Row():
+                m_exp_json = gr.Button("Export JSON")
+                m_exp_csv = gr.Button("Export CSV")
+
+            m_json_file = gr.File(label="Download JSON")
+            m_csv_file = gr.File(label="Download CSV")
+
+            def _ui_compute_metrics():
+                fig_q, fig_qg, table, *_ = compute_metrics()
+                return fig_q, fig_qg, table
+
+            m_refresh.click(_ui_compute_metrics, inputs=[], outputs=[m_plot_q, m_plot_qg, m_table])
+
+            m_exp_json.click(lambda: export_metrics_json(), inputs=[], outputs=[m_json_file])
+            m_exp_csv.click(lambda: export_metrics_csv(), inputs=[], outputs=[m_csv_file])
+
+        with gr.Accordion("Reading Insights by Grade", open=False):
+            li_grade = gr.Slider(1, 12, value=5, step=1, label="Grade")
+
+            li_refresh = gr.Button("Refresh Insights")
+
+            li_topcats = gr.Dataframe(
+                headers=["Category", "Count"],
+                row_count=5,
+                interactive=False,
+                label="Top 5 Categories (this grade)"
+            )
+
+            li_lex = gr.Dataframe(
+                headers=["Category", "Count (with Lexile)", "Average Lexile"],
+                row_count=5,
+                interactive=False,
+                label="Average Lexile by Category (based on books read)"
+            )
+
+            def _insights_for_grade(grade: int):
+                # top categories
+                cats = top_categories_for_grade(int(grade), 5)
+                topcats = [[c, n] for c, n in cats] or [["(no data)", 0]]
+
+                # average lexile
+                lex_rows = avg_lexile_by_category_for_grade(int(grade))
+                if not lex_rows:
+                    lex_rows = [["(no data)", 0, None]]
+
+                return topcats, lex_rows
+
+            li_refresh.click(_insights_for_grade, inputs=[li_grade], outputs=[li_topcats, li_lex])
+            li_grade.release(_insights_for_grade, inputs=[li_grade], outputs=[li_topcats, li_lex])
+
+            with gr.Accordion("Approvals Queue", open=True):
+                a_grade = gr.Slider(1, 12, value=5, step=1, label="Grade")
+                a_refresh = gr.Button("Refresh queue")
+
+                # Table for quick scan + multi-select for bulk actions
+                a_table = gr.Dataframe(headers=["ID", "Student", "Title", "Lexile", "Status", "Submitted (UTC)"], interactive=False)
+                a_select = gr.CheckboxGroup(label="Select items to approve/reject")
+
+                # NEW: detail viewers
+                a_detail = gr.Dropdown(label="View details for one item", choices=[], value=None)
+                a_quiz_md = gr.Markdown(label="Quiz Answer")
+
+                def _list_pending_for_grade(grade: int):
+                    items = PENDING_LOGS.get(int(grade), [])
+                    rows, options, detail_opts = [], [], []
+                    for it in items:
+                        info = BOOK_DB.get(it["book_id"], {})
+                        title = info.get("title", it["book_id"])
+                        lex = info.get("lexile", "—")
+                        ts = it.get("ts", 0)
+                        rows.append([it["id"], it["student"], title, lex, it.get("status"), time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(ts))])
+                        options.append(pending_label(it))
+                        detail_opts.append(it["id"])
+                    if not rows:
+                        rows = [["(none)", "", "", "", "", ""]]
+                    return (
+                        rows,
+                        gr.update(choices=options, value=[]),
+                        gr.update(choices=detail_opts, value=(detail_opts[0] if detail_opts else None)),
+                        _render_quiz_md(int(grade), detail_opts[0] if detail_opts else None),
+                    )
+
+                def _render_quiz_md(grade: int, req_id: str | None) -> str:
+                    if not req_id:
+                        return "_No item selected._"
+                    for it in PENDING_LOGS.get(int(grade), []):
+                        if it["id"] == req_id:
+                            info = BOOK_DB.get(it["book_id"], {})
+                            title = info.get("title", it["book_id"])
+                            lex = info.get("lexile", "—")
+                            return (
+                                f"**Submission:** `{it['id']}`\n\n"
+                                f"- **Student:** {it['student']}\n"
+                                f"- **Book:** *{title}*  •  Lexile **{lex}**\n"
+                                f"- **Status:** {it['status']}  •  **Quiz passed:** {bool(it.get('quiz_passed'))}\n\n"
+                                f"**Quiz answer:**\n\n> {it.get('quiz_answer','(none)') or '(none)'}"
+                            )
+                    return "_Not found._"
+
+                a_refresh.click(_list_pending_for_grade, inputs=[a_grade], outputs=[a_table, a_select, a_detail, a_quiz_md])
+                a_grade.release(_list_pending_for_grade, inputs=[a_grade], outputs=[a_table, a_select, a_detail, a_quiz_md])
+
+                # Update quiz preview when a different item is selected
+                a_detail.change(lambda g, i: _render_quiz_md(int(g), i), inputs=[a_grade, a_detail], outputs=[a_quiz_md])
+
+                with gr.Row():
+                    a_approve = gr.Button("Approve selected")
+                    a_reject  = gr.Button("Reject selected")
+
+                a_status = gr.Markdown()
+
+                def _extract_ids_from_labels(labels: List[str]) -> List[str]:
+                    # labels look like "req_ab12cd34 — Student — Title (Lexile 820) — pending_approval"
+                    ids = []
+                    for lab in (labels or []):
+                        part = (lab or "").split(" — ", 1)[0]
+                        if part.startswith("req_"):
+                            ids.append(part)
+                    return ids
+
+                def _approve_selected(grade: int, labels: List[str]):
+                    ids = set(_extract_ids_from_labels(labels))
+                    if not ids:
+                        table, opts, det, quiz = _list_pending_for_grade(grade)
+                        student_win, student_rows = _student_overview(grade)
+                        return ("⚠️ No items selected.", table, opts, det, quiz, student_win, student_rows)
+
+                    kept = []
+                    approved = 0
+                    for it in PENDING_LOGS.get(int(grade), []):
+                        if it["id"] in ids:
+                            # approve regardless of quiz_passed (librarian override allowed)
+                            record_reading(grade, it["student"], it["book_id"])
+                            approved += 1
+                        else:
+                            kept.append(it)
+                    PENDING_LOGS[int(grade)] = kept
+
+                    msg = f"✅ Approved {approved} item(s)."
+                    table, opts, det, quiz = _list_pending_for_grade(grade)
+                    student_win, student_rows = _student_overview(grade)
+                    # NEW: clear student status line so student sees fresh state
+                    student_status = ""
+                    return (msg, table, opts, det, quiz, student_win, student_rows, student_status)
+
+                def _reject_selected(grade: int, labels: List[str]):
+                    ids = set(_extract_ids_from_labels(labels))
+                    if not ids:
+                        table, opts, det, quiz = _list_pending_for_grade(grade)
+                        student_win, student_rows = _student_overview(grade)
+                        return ("⚠️ No items selected.", table, opts, det, quiz, student_win, student_rows)
+
+                    kept = []
+                    rejected = 0
+                    for it in PENDING_LOGS.get(int(grade), []):
+                        if it["id"] in ids:
+                            rejected += 1
+                        else:
+                            kept.append(it)
+                    PENDING_LOGS[int(grade)] = kept
+
+                    msg = f"🗑️ Rejected {rejected} item(s)."
+                    table, opts, det, quiz = _list_pending_for_grade(grade)
+                    student_win, student_rows = _student_overview(grade)
+                    # NEW: clear student status line so student sees fresh state
+                    student_status = ""
+                    return (msg, table, opts, det, quiz, student_win, student_rows, student_status)
+
+                a_approve.click(_approve_selected, inputs=[a_grade, a_select], outputs=[a_status, a_table, a_select, a_detail, a_quiz_md, s_winner, s_leader, s_log_msg])
+                a_reject.click(_reject_selected, inputs=[a_grade, a_select], outputs=[a_status, a_table, a_select, a_detail, a_quiz_md, s_winner, s_leader, s_log_msg])
 
         with gr.Accordion("Research Assistant (Prompt)", open=False):
             with gr.Row():
-                l_book = gr.Dropdown(choices=list(BOOK_DB.keys()), value="bk2", label="(Optional) Book ID")
+                l_book = gr.Dropdown(choices=BOOK_CHOICES(), value=FIRST_BOOK_ID_DEFAULT(), label="(Optional) Book")
                 l_allow_web = gr.Checkbox(label="Allow web routing (suggest web sources)", value=True)
                 l_show_snips = gr.Checkbox(label="Show context snippets", value=True)
                 l_debug = gr.Checkbox(label="Show routing debug", value=False)
@@ -653,6 +1522,8 @@ with gr.Blocks(title="Agentic RAG MVP — Student & Librarian") as demo:
             # NEW: Clear button for Research Assistant
             l_clear = gr.Button("Clear")
             l_clear.click(lambda: ("", ""), inputs=None, outputs=[l_q, l_ans])
+
+            # (Reload Books button removed; dynamic reloads are handled elsewhere)
 
         with gr.Accordion("Agentic RAG — Upload Sources", open=False):
             rag_files = gr.Files(label="Upload text/CSV/JSON/DOCX/PDF files", type="filepath")
