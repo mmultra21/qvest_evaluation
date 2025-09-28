@@ -1,0 +1,39 @@
+name: Quantize & Validate (demo)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, agentic-rag-mvp-scaffold ]
+
+jobs:
+  quantize-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r benchmarks/requirements.txt
+
+      - name: Run benchmark (demo model: gpt2)
+        env:
+          MODEL: gpt2
+          MODE: fp16
+          ITER: 5
+        run: |
+          chmod +x benchmarks/run_benchmark_ci.sh
+          ./benchmarks/run_benchmark_ci.sh
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: |
+            ./benchmarks/*.log
+            ./benchmarks/*.json

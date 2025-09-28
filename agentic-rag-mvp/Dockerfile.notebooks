@@ -1,0 +1,43 @@
+# Multi-stage Dockerfile with a separate notebooks stage
+# Stage 1: build runtime dependencies (app image)
+FROM python:3.11-slim AS base
+
+ENV USER=appuser
+RUN groupadd -r $USER && useradd -r -g $USER $USER
+
+# Create a home directory for the unprivileged user and set HOME so
+# jupyter and other tools write runtime files to a writable location.
+ENV HOME=/home/$USER
+RUN mkdir -p $HOME && chown -R $USER:$USER $HOME
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends build-essential gcc curl git \
+  && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /work
+
+# Copy project files first so we can optionally install requirements if present
+COPY . /work
+RUN chown -R $USER:$USER /work
+
+# Ensure the user's jupyter runtime directory exists and is owned by the user.
+RUN mkdir -p $HOME/.local/share/jupyter/runtime \
+  && chown -R $USER:$USER $HOME/.local
+
+# If the repo provides a requirements.txt, install it; this is non-fatal if not present
+RUN if [ -f /work/requirements.txt ]; then pip install --no-cache-dir -r /work/requirements.txt || true; fi
+
+# Stage 2: notebooks image (based on base)
+FROM base AS notebooks
+
+# Install notebook specific deps
+COPY requirements-notebook.txt /work/requirements-notebook.txt
+RUN pip install --no-cache-dir -r /work/requirements-notebook.txt
+
+USER $USER
+ENV PYTHONUNBUFFERED=1
+EXPOSE 8888
+
+# Default: start jupyter lab in /work and make notebooks available
+WORKDIR /work
+CMD ["jupyter", "lab", "--ip=0.0.0.0", "--port=8888", "--no-browser", "--NotebookApp.token=''"]

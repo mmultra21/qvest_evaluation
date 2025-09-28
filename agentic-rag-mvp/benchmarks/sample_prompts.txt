@@ -1,0 +1,5 @@
+Write a concise summary of the following article.
+Explain the difference between supervised and unsupervised learning in two sentences.
+Describe a safety policy for an LLM that refuses to answer personal medical questions.
+Give a short, 3-sentence story about teamwork in a library.
+What is the capital of France?

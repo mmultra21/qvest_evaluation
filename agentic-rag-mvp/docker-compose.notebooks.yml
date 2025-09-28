@@ -1,0 +1,31 @@
+version: '3.8'
+services:
+  notebooks:
+    build:
+      context: .
+      dockerfile: Dockerfile.notebooks
+    volumes:
+      - ./:/work:rw
+      - notebook_outputs:/work/notebook_outputs
+    environment:
+      # Set RUN_NOTEBOOKS=true to execute notebooks on container start (papermill)
+      - RUN_NOTEBOOKS=false
+      # Wire qdrant URL for RAG demos inside notebooks
+      - QDRANT_URL=http://qdrant:6333
+    ports:
+      - "8888:8888"
+    depends_on:
+      - qdrant
+    restart: unless-stopped
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports:
+      - "6334:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    restart: unless-stopped
+
+volumes:
+  notebook_outputs:
+  qdrant_data:

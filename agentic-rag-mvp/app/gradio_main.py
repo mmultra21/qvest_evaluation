@@ -14,7 +14,7 @@ To run the UI locally for interactive testing, execute:
 from __future__ import annotations
 
 import gradio as gr
-from typing import Dict, Any
+from typing import Dict, Any, List
 import os
 import time
 import json
@@ -27,6 +27,167 @@ BOOK_DB = globals().get("BOOK_DB", {
     "book2": {"title": "Space Adventure", "author": "B. Writer", "lexile": 850, "grade": "4-6", "category": "science"},
     "book3": {"title": "History 101", "author": "C. Historian", "lexile": 950, "grade": "6-8", "category": "history"},
 })
+
+# ===== Demo defaults and lightweight placeholders to keep the module import-safe =====
+AUTH_STUDENTS = globals().get("AUTH_STUDENTS", {})
+
+# Minimal campaign placeholder used by some UI pickers
+CAMPAIGN = globals().get("CAMPAIGN", {
+    "title": "Reading Week Spotlight",
+    "prize_rules": "",
+    "categories": ["fiction", "non-fiction", "science"],
+    "seed_list": [],
+})
+DEFAULT_CATEGORIES = ["fiction", "non-fiction", "science"]
+
+# Simple in-memory audit/leader stores used by parts of the UI
+PENDING_LOGS = globals().get("PENDING_LOGS", {})
+READ_LOGS = globals().get("READ_LOGS", {})
+LAST_WEEK_WINNERS = globals().get("LAST_WEEK_WINNERS", {})
+
+
+def _book_label_choices():
+    return [_book_label(bid) for bid in BOOK_DB.keys()]
+
+
+def BOOK_CHOICES():
+    return list(BOOK_DB.keys())
+
+
+def FIRST_BOOK_ID_DEFAULT():
+    return next(iter(BOOK_DB.keys())) if BOOK_DB else ""
+
+
+def SEED_BOOK_CHOICES():
+    return _book_label_choices()
+
+
+def _prefill_request_fields(book_label: str):
+    bk = _parse_id_from_label(book_label)
+    info = BOOK_DB.get(bk, {})
+    return info.get("lexile", None), info.get("category", "other")
+
+
+def _student_requests_table(grade: int, name: str):
+    name = (name or "").strip()
+    rows = []
+    for it in BOOK_REQUESTS.get(name, []):
+        rows.append([
+            time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(it.get("requested_at", time.time()))),
+            BOOK_DB.get(it.get("book_id", ""), {}).get("title", it.get("book_id", "")),
+            it.get("lexile", "—"),
+            it.get("category", "—"),
+            it.get("date_needed", "—") or "—",
+            it.get("status", "pending"),
+            it.get("available_on", "—") or "—",
+        ])
+    if not rows:
+        rows = [["(none)", "", "", "", "", "", ""]]
+    return rows
+
+
+def _validate_iso_date_or_none(s: str):
+    if not s:
+        return None
+    try:
+        time.strptime(s, "%Y-%m-%d")
+        return s
+    except Exception:
+        return None
+
+
+def winner_text_for_grade(grade: int) -> str:
+    w = LAST_WEEK_WINNERS.get(int(grade))
+    if not w:
+        return f"No winner yet for grade {grade}."
+    return f"Winner: {w.get('student')} — {w.get('count')} reads"
+
+
+def top_readers_by_grade(grade: int, k: int = 5):
+    # return empty default; real implementation uses READ_LOGS
+    return []
+
+
+def render_recommended_for_grade(grade: int) -> str:
+    return "_(no recommendations configured)_"
+
+
+def campaign_markdown(c: dict) -> str:
+    return f"**{c.get('title','Campaign')}**\n\n{c.get('prize_rules','')}"
+
+
+# ===== Lightweight stubs for missing app integrations (demo-safe) =====
+def ui_student_learn_book(book_id: str, question: str) -> str:
+    """Demo student 'learn about a book' handler."""
+    if not book_id or not question:
+        return "Please select a book and ask a short question."
+    info = BOOK_DB.get(book_id, {})
+    return f"(demo) {info.get('title','Unknown')} — {info.get('author','Unknown')}: {question}"
+
+
+def ui_librarian_leaderboard(grade: int):
+    # return rows for Dataframe
+    return []
+
+
+def winner_markdown_for_grade(grade: int) -> str:
+    return winner_text_for_grade(grade)
+
+
+def compute_metrics():
+    # return placeholders: (fig1, fig2, table)
+    return None, None, []
+
+
+def export_metrics_json():
+    return json.dumps({"metrics": []}, indent=2)
+
+
+def export_metrics_csv():
+    return "id,value\n"
+
+
+def top_categories_for_grade(grade: int, k: int = 5):
+    return []
+
+
+def avg_lexile_by_category_for_grade(grade: int):
+    return []
+
+
+def pending_label(it: dict) -> str:
+    return f"{it.get('label')} — requested by {it.get('user')}"
+
+
+def record_reading(grade: int, student: str, book_id: str):
+    # update READ_LOGS minimally
+    READ_LOGS.setdefault(int(grade), {}).setdefault(student, {}).setdefault("books", []).append(book_id)
+
+
+def _librarian_requests_table(only_pending: bool = True):
+    rows = []
+    for it in LIBRARIAN_QUEUES.get("requests", []):
+        if only_pending and it.get("status") != "pending":
+            continue
+        rows.append([
+            it.get("user"), it.get("label"), it.get("date_needed"), it.get("status")
+        ])
+    if not rows:
+        rows = [["(none)", "", "", ""]]
+    return rows
+
+
+def _find_request_by_id(req_id: str):
+    for it in LIBRARIAN_QUEUES.get("requests", []):
+        if it.get("id") == req_id or it.get("id", "") == req_id:
+            return it
+    return None
+
+
+def vs_stats():
+    # demo placeholder for vector store stats
+    return {"collection": "demo", "size": 0}
+
 
 # Lightweight stubs for services used in the legacy code. These make the
 # module importable in demo mode. Replace with real implementations later.
@@ -222,6 +383,135 @@ def refresh_my_requests(user: str):
         _book_label(r["book_id"]) for r in _student_requests(user) if r.get("status") == "approved"
     ]
     return rows, approved_choices
+
+
+def _refresh_approved_dropdown(user: str):
+    """Return the list of approved choices for the student's approved-requests dropdown."""
+    try:
+        _, approved = refresh_my_requests(user)
+        return approved or []
+    except Exception:
+        return []
+
+
+def _mark_request_returned(user: str, grade: int, approved_label: str):
+    """Mark an approved request as returned (moves to returned_pending) and update stores.
+
+    Returns a status message and the updated approved choices list.
+    This is intentionally lightweight/demo-only: it mutates the in-memory BOOK_REQUESTS
+    and pushes a small record into LIBRARIAN_QUEUES['returns'] for librarian verification.
+    """
+    user = (user or "").strip()
+    if not user:
+        return "Please enter your name.", []
+    book_id = _parse_id_from_label(approved_label)
+    if not book_id:
+        return "Please select a valid approved book.", _refresh_approved_dropdown(user)
+
+    # find the matching approved request and mark it returned_pending
+    found = False
+    for r in _student_requests(user):
+        if r.get("book_id") == book_id and r.get("status") == "approved":
+            r["status"] = "returned_pending"
+            r["returned_at"] = time.time()
+            found = True
+            break
+
+    if not found:
+        return "Could not find an approved request for that book (maybe already returned).", _refresh_approved_dropdown(user)
+
+    # push to librarian returns queue for immediate in-memory visibility
+    LIBRARIAN_QUEUES.setdefault("returns", []).append({
+        "user": user,
+        "book_id": book_id,
+        "label": _book_label(book_id),
+        "grade": grade,
+        "status": "pending",
+        "submitted_at": time.time(),
+    })
+
+    # Also persist an audit row into the shared SQLite DB so Admin UI / judge see it
+    try:
+        import sqlite3, json
+        ROOT = os.path.dirname(os.path.dirname(__file__))
+        DATA_DIR = os.path.join(ROOT, 'data')
+        DB_PATH = os.path.join(DATA_DIR, 'agent.db')
+        os.makedirs(DATA_DIR, exist_ok=True)
+
+        # Ensure table exists (compatible with tools/agent_job schema)
+        con = sqlite3.connect(DB_PATH)
+        cur = con.cursor()
+        cur.executescript('''
+        CREATE TABLE IF NOT EXISTS audit_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT,
+            student_id TEXT,
+            action_type TEXT,
+            payload TEXT,
+            status TEXT,
+            notes TEXT
+        );
+        CREATE TABLE IF NOT EXISTS students (
+            student_id TEXT PRIMARY KEY,
+            last_30_days_borrows INTEGER DEFAULT 0,
+            metadata TEXT
+        );
+        ''')
+
+        payload = {
+            "user": user,
+            "book_id": book_id,
+            "label": _book_label(book_id),
+            "grade": grade,
+            "returned_at": time.time(),
+            "source": "student_ui"
+        }
+        from datetime import datetime
+        cur.execute('INSERT INTO audit_logs(created_at, student_id, action_type, payload, status, notes) VALUES (?, ?, ?, ?, ?, ?)',
+                    (datetime.utcnow().isoformat(), user, 'return_book', json.dumps(payload), 'pending_approval', None))
+        inserted_id = cur.lastrowid
+        con.commit()
+
+        # If judge candidate function exists, try to call it (non-fatal)
+        try:
+            from tools.llm_judge import judge_candidates
+        except Exception:
+            judge_candidates = None
+
+        if judge_candidates is not None:
+            try:
+                # build a candidate with small text for judge
+                candidate = [{"audit_id": inserted_id, "text": payload.get("label") or json.dumps(payload)}]
+                judge_candidates(candidate)
+            except Exception:
+                pass
+
+        # Optionally auto-approve if judge score meets threshold
+        try:
+            thresh = float(os.environ.get('AUTO_APPROVE_THRESHOLD', '')) if os.environ.get('AUTO_APPROVE_THRESHOLD') else None
+        except Exception:
+            thresh = None
+        if thresh is not None:
+            try:
+                cur.execute('SELECT score FROM judge_logs WHERE audit_id = ? ORDER BY created_at DESC LIMIT 1', (inserted_id,))
+                row = cur.fetchone()
+                if row:
+                    score = float(row[0])
+                    if score >= thresh:
+                        note = f"auto-approved (score={score})"
+                        cur.execute('UPDATE audit_logs SET status = ?, notes = ? WHERE id = ?', ('approved', note, inserted_id))
+                        con.commit()
+            except Exception:
+                pass
+
+        con.close()
+    except Exception as e:
+        # Non-fatal for demo; keep in-memory queue regardless
+        # If there's an error, leave the in-memory return for manual processing
+        print('Warning: could not persist return to DB:', e)
+
+    msg = f"Marked **{_book_label(book_id)}** as returned (pending librarian verification)."
+    return msg, _refresh_approved_dropdown(user)
 
 
 # ===== Librarian-side handlers =====
@@ -1717,8 +2007,16 @@ except Exception:
 # Demo mode: simple banner-only login; no additional wiring required here.
 # The Sign-in button already wires directly to `demo_login` above.
 
-app = mount_gradio_app(app, demo, path="/")
+try:
+    # If a FastAPI `app` is present in the environment (e.g., when imported by api.main), mount into it.
+    import api.main as _api_main  # type: ignore
+    _api_app = getattr(_api_main, "app", None)
+    if _api_app is not None:
+        mount_gradio_app(_api_app, demo, path="/")
+except Exception:
+    # No FastAPI app to mount into; leave Gradio to be launched standalone below if run as __main__
+    pass
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host=os.getenv("HOST", "127.0.0.1"), port=int(os.getenv("PORT", "8000")))
+    # Running as a script launches Gradio locally (default behavior)
+    demo.launch(share=False)
