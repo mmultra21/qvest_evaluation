@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="400" viewBox="0 0 1200 400">
+  <style>
+    .box { fill: #ffffff; stroke: #2b6cb0; stroke-width:2; rx:8; }
+    .text { font-family: Arial, sans-serif; font-size:16px; fill:#1a202c; }
+    .arrow { stroke:#2b6cb0; stroke-width:3; fill:none; marker-end: url(#arrowhead); }
+  </style>
+  <defs>
+    <marker id="arrowhead" markerWidth="10" markerHeight="7" refX="10" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#2b6cb0" />
+    </marker>
+  </defs>
+  
+  <!-- Boxes -->
+  <rect x="20" y="140" width="180" height="80" class="box" />
+  <text x="110" y="180" text-anchor="middle" class="text">Student UI</text>
+  
+  <rect x="240" y="120" width="220" height="120" class="box" />
+  <text x="350" y="160" text-anchor="middle" class="text">
+    <tspan x="350" dy="0">Recommendation Engine</tspan>
+  <tspan x="350" dy="20">(ML rules &amp; history)</tspan>
+  </text>
+  
+  <rect x="490" y="120" width="220" height="120" class="box" />
+  <text x="600" y="160" text-anchor="middle" class="text">
+    <tspan x="600" dy="0">Librarian Review</tspan>
+    <tspan x="600" dy="20">&amp; Curation</tspan>
+  </text>
+  
+  <rect x="740" y="120" width="220" height="120" class="box" />
+  <text x="850" y="160" text-anchor="middle" class="text">
+    <tspan x="850" dy="0">Student Feedback</tspan>
+    <tspan x="850" dy="20">(accept/rate/ignore)</tspan>
+  </text>
+  
+  <rect x="990" y="140" width="180" height="80" class="box" />
+  <text x="1080" y="180" text-anchor="middle" class="text">Metrics &amp; Dashboard</text>
+
+  <!-- Arrows -->
+  <path d="M200 180 L240 180" class="arrow" />
+  <path d="M460 180 L490 180" class="arrow" />
+  <path d="M710 180 L740 180" class="arrow" />
+  <path d="M960 180 L990 180" class="arrow" />
+
+  <!-- Feedback loop arrow back to engine -->
+  <path d="M850 240 C850 300, 500 300, 500 240" class="arrow" />
+
+  <!-- Labels -->
+  <text x="120" y="215" text-anchor="middle" class="text">1. View recommendations</text>
+  <text x="350" y="95" text-anchor="middle" class="text">Uses historical data + signals</text>
+  <text x="600" y="95" text-anchor="middle" class="text">Curate &amp; tag recommendations</text>
+  <text x="850" y="95" text-anchor="middle" class="text">Provide feedback (ratings)</text>
+  <text x="1080" y="215" text-anchor="middle" class="text">Track adoption & leaderboard</text>
+</svg>

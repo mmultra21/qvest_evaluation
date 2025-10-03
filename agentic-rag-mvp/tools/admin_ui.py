@@ -60,7 +60,97 @@ def get_pending_rows() -> List[Dict[str, Any]]:
                 judge_id, judge_label, judge_score, judge_created_at = jr[0], jr[1], jr[2], jr[3]
         except Exception:
             pass
-        out.append({'id': id_, 'created_at': created_at, 'student_id': student_id, 'action_type': action_type, 'payload': pl, 'status': status, 'notes': notes, 'judge_label': judge_label, 'judge_score': judge_score, 'judge_id': judge_id, 'judge_created_at': judge_created_at})
+        # Try to extract a human-friendly book title for audit rows when possible
+        book_title = None
+        try:
+            # payload may be dict-like
+            if isinstance(pl, dict):
+                # candidate keys that may contain book id or label
+                bid = pl.get('book_id') or pl.get('book') or pl.get('id')
+                if bid is not None:
+                    # numeric IDs stored as ints in some places, or strings elsewhere
+                    try:
+                        # If book ids in this repo are numeric (like 1,2,..) try integer mapping
+                        bid_int = int(bid)
+                    except Exception:
+                        bid_int = None
+                    # First, try in-module BOOK_DB if present (common admin stub)
+                    try:
+                        BOOK_DB  # type: ignore
+                        info = globals().get('BOOK_DB', {})
+                        # If book ids in BOOK_DB are stored as keys, try both string and numeric
+                        candidate = None
+                        if str(bid) in info:
+                            candidate = info.get(str(bid))
+                        elif bid_int is not None and bid_int in info:
+                            candidate = info.get(bid_int)
+                        if candidate and isinstance(candidate, dict):
+                            book_title = candidate.get('title')
+                    except Exception:
+                        book_title = None
+
+                # Prefer explicit title fields in the payload (common from student UI or agent jobs)
+                if isinstance(pl, dict):
+                    if not book_title:
+                        maybe_title = pl.get('title') or pl.get('book_title') or pl.get('label')
+                        if maybe_title:
+                            book_title = str(maybe_title)[:200]
+                    # If payload had a numeric id but no title, fall back to BOOK_DB mapping
+                    if not book_title and bid is not None:
+                        try:
+                            info = globals().get('BOOK_DB', {})
+                            if str(bid) in info and isinstance(info.get(str(bid)), dict):
+                                book_title = info.get(str(bid)).get('title')
+                            elif bid_int is not None and bid_int in info and isinstance(info.get(bid_int), dict):
+                                book_title = info.get(bid_int).get('title')
+                        except Exception:
+                            book_title = None
+
+                    # Prefer a canonical catalog table in the shared DB if available
+                    if not book_title and bid_int is not None:
+                        try:
+                            # look for a books table with title column
+                            con3 = sqlite3.connect(DB_PATH)
+                            cur3 = con3.cursor()
+                            row3 = None
+                            try:
+                                cur3.execute('SELECT title FROM books WHERE book_id = ? LIMIT 1', (bid_int,))
+                                row3 = cur3.fetchone()
+                            except Exception:
+                                row3 = None
+                            if not row3:
+                                try:
+                                    cur3.execute('SELECT title FROM books WHERE id = ? LIMIT 1', (bid_int,))
+                                    row3 = cur3.fetchone()
+                                except Exception:
+                                    row3 = None
+                            if row3 and row3[0]:
+                                book_title = str(row3[0])
+                            con3.close()
+                        except Exception:
+                            # DB lookup failed/no table; fall through to other fallbacks
+                            book_title = None
+
+                    # If still None and we have numeric book ids (catalog DF in POC), try importing it
+                    if not book_title and bid_int is not None:
+                        try:
+                            import importlib
+                            poc = importlib.import_module('agentic-rag-mvp.tools.run_gradio_poc')
+                            if hasattr(poc, 'catalog'):
+                                try:
+                                    df = poc.catalog
+                                    # find row where book_id == bid_int
+                                    row = df[df['book_id'] == bid_int]
+                                    if row is not None and len(row) > 0:
+                                        book_title = str(row.iloc[0]['title'])
+                                except Exception:
+                                    book_title = None
+                        except Exception:
+                            book_title = None
+        except Exception:
+            book_title = None
+
+        out.append({'id': id_, 'created_at': created_at, 'student_id': student_id, 'action_type': action_type, 'payload': pl, 'status': status, 'notes': notes, 'book_title': book_title, 'judge_label': judge_label, 'judge_score': judge_score, 'judge_id': judge_id, 'judge_created_at': judge_created_at})
     return out
 
 
@@ -332,11 +422,19 @@ try:
                         payload_preview = str(r.get('payload'))
                     jid = r.get('judge_id')
                     jid_html = f"<div style='font-size:0.85em;color:#9ca3af'>J:{jid}</div>" if jid else ''
+                    # show an optional title if available for quick inspection
+                    title_html = ''
+                    try:
+                        bt = r.get('book_title')
+                        if bt:
+                            title_html = f"<div style='font-size:0.95em;color:#9ee6c2;margin-top:4px'>{_escape_html(str(bt))}</div>"
+                    except Exception:
+                        title_html = ''
                     table_rows.append(
                         "<div style='padding:8px;border-bottom:1px dashed #374151;display:flex;gap:12px;align-items:flex-start'>"
                         f"<div style='min-width:58px;color:#cbd5e1'><strong>{r['id']}</strong><div style='font-size:0.85em;color:#9ca3af'>{_escape_html(str(r.get('created_at') or ''))}</div>{jid_html}</div>"
                         f"<div style='min-width:120px;color:#e6eef8'>{_escape_html(str(r.get('student_id') or ''))}<div style='font-size:0.85em;color:#9ca3af'>{_escape_html(str(r.get('status') or ''))}</div></div>"
-                        f"<div style='flex:1;min-width:200px;color:#e6eef8'><div style='font-weight:600'>{_escape_html(str(r.get('action_type') or ''))} { _escape_html(j) }</div><div style='font-family:monospace;color:#cbd5e1;margin-top:6px;white-space:pre-wrap'>{_escape_html(_truncate(payload_preview, 240))}</div></div>"
+                        f"<div style='flex:1;min-width:200px;color:#e6eef8'><div style='font-weight:600'>{_escape_html(str(r.get('action_type') or ''))} { _escape_html(j) }</div>{title_html}<div style='font-family:monospace;color:#cbd5e1;margin-top:6px;white-space:pre-wrap'>{_escape_html(_truncate(payload_preview, 240))}</div></div>"
                         "</div>"
                     )
                 html = (

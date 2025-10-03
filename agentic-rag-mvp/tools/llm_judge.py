@@ -22,6 +22,8 @@ import os
 import sqlite3
 import sys
 import typing as t
+import time
+import re
 
 HERE = os.path.abspath(os.path.dirname(__file__))
 REPO_ROOT = os.path.abspath(os.path.join(HERE, ".."))
@@ -85,6 +87,17 @@ def init_db(db_path: str = DB_PATH_DEFAULT) -> None:
         )
         """
     )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS hermes_raw_responses (
+            id INTEGER PRIMARY KEY,
+            audit_id INTEGER,
+            url TEXT,
+            raw_body TEXT,
+            created_at TEXT
+        )
+        """
+    )
     conn.commit()
     conn.close()
 
@@ -114,7 +127,7 @@ def heuristic_score(text: str) -> float:
     return score
 
 
-def _call_hermes_score(text: str, prompt: t.Optional[str] = None) -> t.Tuple[float, str]:
+def _call_hermes_score(text: str, prompt: t.Optional[str] = None, audit_id: t.Optional[int] = None, db_path: str = DB_PATH_DEFAULT) -> t.Tuple[float, str]:
     """Call the hermes client to obtain a score and a short reason.
 
     This function assumes the local environment exposes a simple scoring API. If it fails,
@@ -139,59 +152,101 @@ def _call_hermes_score(text: str, prompt: t.Optional[str] = None) -> t.Tuple[flo
 
     # HTTP fallback: try to call a local Hermes3/llama server compatible with /v1/completions
     if _have_urllib and HERMES_HTTP_URL:
+        # health-check first to avoid noisy failed calls
         try:
-            # construct a minimal OpenAI-style completions request
-            req_prompt = (
-                (prompt or "") + "\n\n" +
-                "Rate the following text for safety and suitability for a student-facing recommendation on a scale 0.0-1.0. "
-                "Respond only with a JSON object like: {\"score\": 0.85, \"reason\": \"short note\"}.\nText:\n" + text
-            )
+            health_url = HERMES_HTTP_URL.rstrip("/") + "/health"
+            reqh = urllib.request.Request(health_url, method="GET")
+            ctx = ssl.create_default_context()
+            with urllib.request.urlopen(reqh, timeout=3, context=ctx) as rh:
+                code = rh.getcode()
+            if code != 200:
+                raise RuntimeError(f"Hermes health check returned {code}")
+        except Exception:
+            # Hermes not healthy / not reachable
+            raise RuntimeError("Hermes HTTP health check failed")
 
-            payload = json.dumps({
+        # construct a minimal OpenAI-style completions request once
+        # Prompt-tuning: require the model to emit the JSON on the FIRST line, then optionally explain.
+        example_json = json.dumps({"score": 0.92, "reason": "example: suitable for middle graders"})
+        # If the model cannot produce JSON, instruct it to return this exact fallback JSON so we always get parseable output
+        fallback_json = json.dumps({"score": 0.0, "reason": "unable to produce JSON"})
+        req_prompt = (
+            (prompt or "")
+            + "\n\n"
+            + "FIRST LINE MUST BE a JSON object with keys 'score' (0.0-1.0) and 'reason' (short string). After that you may optionally write an explanation.\n"
+            + "Example first line: "
+            + example_json
+            + "\nIf you cannot produce the requested JSON, the FIRST LINE must be exactly: "
+            + fallback_json
+            + "\nText:\n"
+            + text
+        )
+
+        # Include a stop token to reduce trailing non-JSON text (Hermes3 may honor 'stop')
+        payload = json.dumps(
+            {
                 "model": os.environ.get("HERMES3_MODEL") or "hermes3",
                 "prompt": req_prompt,
-                "max_tokens": 64,
+                "max_tokens": 128,
                 "temperature": 0.0,
-            }).encode("utf-8")
+                "stop": ["\n\n"]
+            }
+        ).encode("utf-8")
 
-            headers = {"Content-Type": "application/json"}
-            req = urllib.request.Request(HERMES_HTTP_URL.rstrip("/") + "/v1/completions", data=payload, headers=headers, method="POST")
-            ctx = ssl.create_default_context()
-            with urllib.request.urlopen(req, timeout=8, context=ctx) as resp:
-                body = resp.read().decode("utf-8", errors="ignore")
-                # First try to parse top-level JSON
+        headers = {"Content-Type": "application/json"}
+        url = HERMES_HTTP_URL.rstrip("/") + "/v1/completions"
+
+        # retry with exponential backoff for transient empty/garbled responses
+        attempts = 3
+        parsed_candidates: t.List[t.Tuple[float, str, str]] = []  # list of (score, reason, raw_body)
+        last_body = None
+        for attempt in range(attempts):
+            try:
+                req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
+                with urllib.request.urlopen(req, timeout=10, context=ssl.create_default_context()) as resp:
+                    body = resp.read().decode("utf-8", errors="ignore")
+                last_body = body
+
+                # Try parsing strategies in order of confidence
+                # 1) top-level JSON
                 try:
                     parsed = json.loads(body)
                     # Hermes-like servers return {'choices': [{'text': '...'}], ...}
                     if isinstance(parsed, dict) and "choices" in parsed and parsed["choices"]:
                         txt = parsed["choices"][0].get("text", "")
-                        # try to find JSON inside the text
-                        import re
+                        # attempt to extract JSON inside txt
                         m = re.search(r"\{\s*\"score\".*?\}", txt, flags=re.S)
                         if m:
                             j = json.loads(m.group(0))
                             sc = float(j.get("score", 0.5))
                             reason = str(j.get("reason", ""))
-                            return sc, reason
-                        m2 = re.search(r"([01](?:\.\d{1,3})?)", txt)
-                        if m2:
-                            sc = float(m2.group(1))
-                            return sc, txt[:400]
-                    # If top-level JSON doesn't match, search body text for JSON object
-                    import re
+                            parsed_candidates.append((sc, reason, txt))
+                        else:
+                            # fallback: numeric token in the text
+                            m2 = re.search(r"([01](?:\.\d{1,4})?)", txt)
+                            if m2:
+                                sc = float(m2.group(1))
+                                parsed_candidates.append((sc, txt[:400], txt))
+
+                    # 2) search the whole body for a JSON object containing score
                     m = re.search(r"\{\s*\"score\".*?\}", body, flags=re.S)
                     if m:
-                        j = json.loads(m.group(0))
-                        sc = float(j.get("score", 0.5))
-                        reason = str(j.get("reason", ""))
-                        return sc, reason
-                    m2 = re.search(r"([01](?:\.\d{1,3})?)", body)
+                        try:
+                            j = json.loads(m.group(0))
+                            sc = float(j.get("score", 0.5))
+                            reason = str(j.get("reason", ""))
+                            parsed_candidates.append((sc, reason, body))
+                        except Exception:
+                            pass
+
+                    # 3) find any numeric-looking token that looks like a score
+                    m2 = re.search(r"([01](?:\.\d{1,4})?)", body)
                     if m2:
                         sc = float(m2.group(1))
-                        return sc, body[:400]
+                        parsed_candidates.append((sc, body[:400], body))
+
                 except Exception:
-                    # fallback to regex extraction from raw body
-                    import re
+                    # try looser regex-only extraction
                     m = re.search(r"\{\s*\"score\".*?\}", body, flags=re.S)
                     if m:
                         try:
@@ -201,15 +256,48 @@ def _call_hermes_score(text: str, prompt: t.Optional[str] = None) -> t.Tuple[flo
                             return sc, reason
                         except Exception:
                             pass
-                    m2 = re.search(r"([01](?:\.\d{1,3})?)", body)
+                    m2 = re.search(r"([01](?:\.\d{1,4})?)", body)
                     if m2:
                         sc = float(m2.group(1))
                         return sc, body[:400]
-        except Exception:
-            pass
 
-    # If we reach here, Hermes isn't accessible in any automated way
-    raise RuntimeError("Hermes scoring not available (no python client and no reachable HTTP server)")
+                # If we reached here, the response was not parseable for this attempt – treat as transient
+                if attempt < attempts - 1:
+                    time.sleep(0.8 * (2 ** attempt))
+                    continue
+                # last attempt fell through: we'll decide based on aggregated parsed_candidates below
+                break
+            except Exception:
+                # retry on network or parse errors
+                if attempt < attempts - 1:
+                    time.sleep(0.8 * (2 ** attempt))
+                    continue
+                # give up after attempts
+                break
+
+        # After attempts, prefer the best non-zero parsed candidate (highest score). If none, but we have any parsed candidate, take the max.
+        if parsed_candidates:
+            # choose the candidate with highest score
+            parsed_candidates.sort(key=lambda x: x[0], reverse=True)
+            best = parsed_candidates[0]
+            return float(best[0]), str(best[1])
+        # If we have a last_body but couldn't parse anything, persist the raw response for diagnostics and then raise
+        if last_body and audit_id:
+            try:
+                init_db(db_path)
+                conn = sqlite3.connect(db_path)
+                cur = conn.cursor()
+                cur.execute(
+                    "INSERT INTO hermes_raw_responses (audit_id, url, raw_body, created_at) VALUES (?,?,?,?)",
+                    (audit_id, url, last_body[:20000], datetime.datetime.utcnow().isoformat() + "Z"),
+                )
+                conn.commit()
+                conn.close()
+            except Exception:
+                # don't let debug persistence break the main flow
+                pass
+
+    raise RuntimeError("Hermes returned unparseable response after retries")
 
 
 def judge_candidates(
@@ -237,7 +325,7 @@ def judge_candidates(
         used_model = "heuristic"
         try:
             # Try Hermes scoring path (python client or HTTP fallback inside _call_hermes_score)
-            score, reason = _call_hermes_score(text, prompt=prompt)
+            score, reason = _call_hermes_score(text, prompt=prompt, audit_id=aid, db_path=db_path)
             used_model = model_name
         except Exception:
             # any failure falls back to heuristic

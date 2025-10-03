@@ -133,7 +133,48 @@ def cosine_sim(a, B):
     sim[nz] = dots[nz] / denom[nz]
     return sim
 
-def recommend_by_student(student_id=None, query_text=None, top_k=5, use_semantic: bool = False):
+
+def _fetch_db_approved_recs(student_id: str, top_k: int = 5, db_path: str | None = None):
+    """Return approved recommend_email rows from audit_logs for a student as (book_id, score, row).
+    This mirrors the UI behavior and preserves order (most recent first) and dedupes by book_id.
+    """
+    try:
+        import sqlite3
+        ROOT = os.path.dirname(os.path.dirname(__file__))
+        DB_PATH = os.path.join(ROOT, 'data', 'agent.db') if db_path is None else db_path
+        if not os.path.exists(DB_PATH):
+            return []
+        con = sqlite3.connect(DB_PATH)
+        cur = con.cursor()
+        cur.execute("SELECT id, payload FROM audit_logs WHERE student_id = ? AND action_type = 'recommend_email' AND status = 'approved' ORDER BY id DESC LIMIT ?", (student_id, top_k))
+        rows = cur.fetchall()
+        recs = []
+        for _, payload in rows:
+            try:
+                j = json.loads(payload)
+                if isinstance(j, dict) and 'book_id' in j:
+                    bid = int(j['book_id'])
+                    if bid in book_index:
+                        row = catalog.iloc[book_index[bid]]
+                        recs.append((bid, float(j.get('score', 0.0)), row))
+            except Exception:
+                continue
+        con.close()
+        # dedupe while preserving order
+        if recs:
+            seen_bids = set()
+            dedup = []
+            for bid, score, row in recs:
+                if bid in seen_bids:
+                    continue
+                seen_bids.add(bid)
+                dedup.append((bid, score, row))
+            return dedup
+        return []
+    except Exception:
+        return []
+
+def recommend_by_student(student_id=None, query_text=None, top_k=5, use_semantic: bool = False, prefer_db_recs: bool = False):
     # embeddings path
     # Only use embeddings if the environment built them AND caller opted in via use_semantic
     if use_embeddings and use_semantic:
@@ -162,6 +203,12 @@ def recommend_by_student(student_id=None, query_text=None, top_k=5, use_semantic
                 return results
         except Exception:
             pass
+
+    # Optionally prefer DB-approved recommend_email rows (keeps parity with UI)
+    if student_id and prefer_db_recs:
+        db_recs = _fetch_db_approved_recs(student_id, top_k=top_k)
+        if db_recs:
+            return db_recs[:top_k]
 
     # fallback TF-IDF
     if student_id:
@@ -264,6 +311,16 @@ def create_gradio_interface(port: int | None = None):
                         except Exception:
                             continue
                     con.close()
+                    # Deduplicate DB-sourced recommendations by book_id while preserving order
+                    if recs:
+                        seen_bids = set()
+                        deduped = []
+                        for bid, score, row in recs:
+                            if bid in seen_bids:
+                                continue
+                            seen_bids.add(bid)
+                            deduped.append((bid, score, row))
+                        recs = deduped
             except Exception:
                 # fallback to recommender if DB path or query fails
                 recs = []

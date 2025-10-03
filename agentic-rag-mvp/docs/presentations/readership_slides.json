@@ -1,0 +1,4 @@
+[
+  {"title":"Increase Student Readership — Overview","bullets":["Use case: increase book readership among students through librarian recommendations and student visibility","Goal: boost engagement, measure impact, and identify top readers"],"notes":"High-level summary of campaign goals and expected outcomes."},
+  {"title":"Proposed Solution","bullets":["Librarian curates recommendations using historical data and an evaluation tool","Students see personalized recommendations and can opt in to campaigns","Lightweight web UI + backend recommendation engine; optional Gradio proof-of-concept"],"notes":"Describe architecture: data -> model/rules -> UI -> feedback loop."}
+]
